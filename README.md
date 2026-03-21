@@ -69,18 +69,11 @@ gmk help
 
 ### pnpm
 
-Install globally from GitHub:
+`pnpm` may require a per-package allow-build flag for git installs because this package runs `prepare` during installation.
 
 ```bash
-pnpm add -g github:lirrensi/git-mark
+pnpm add -g --allow-build=git-mark github:lirrensi/git-mark
 gmk help
-```
-
-If `pnpm` blocks the `prepare` build script, approve `git-mark` builds and run the install again:
-
-```bash
-pnpm approve-builds -g
-pnpm add -g github:lirrensi/git-mark
 ```
 
 Run it once with `npx` without a global install:
