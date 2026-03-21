@@ -69,17 +69,25 @@ gmk help
 
 ### pnpm
 
-`pnpm` may require a per-package allow-build flag for git installs because this package runs `prepare` during installation.
+`pnpm` may require a per-package allow-build flag for git installs because this package builds itself during git install.
 
 ```bash
 pnpm add -g --allow-build=git-mark github:lirrensi/git-mark
 gmk help
 ```
 
+After a global install, the MCP server binary is still `git-mark-mcp`.
+
 Run it once with `npx` without a global install:
 
 ```bash
 npx --package github:lirrensi/git-mark gmk help
+```
+
+Run the MCP server once with `npx` without a global install:
+
+```bash
+npx --package github:lirrensi/git-mark git-mark-mcp
 ```
 
 From this repository:
