@@ -56,11 +56,31 @@ Requirements:
 - Node.js 24+
 - `git` on your `PATH`
 
+Git-based installs build the published JavaScript during install.
+
+### npm
+
 Install globally from GitHub:
 
 ```bash
 npm install -g github:lirrensi/git-mark
 gmk help
+```
+
+### pnpm
+
+Install globally from GitHub:
+
+```bash
+pnpm add -g github:lirrensi/git-mark
+gmk help
+```
+
+If `pnpm` blocks the `prepare` build script, approve `git-mark` builds and run the install again:
+
+```bash
+pnpm approve-builds -g
+pnpm add -g github:lirrensi/git-mark
 ```
 
 Run it once with `npx` without a global install:
@@ -73,7 +93,8 @@ From this repository:
 
 ```bash
 npm install
-node --experimental-strip-types src/cli.ts help
+pnpm build
+node dist/cli.js help
 ```
 
 Available binaries:
@@ -412,7 +433,7 @@ Start the server:
 git-mark-mcp
 ```
 
-If you are running from the repo instead of an installed binary:
+If you are running from the repo for local development instead of an installed binary:
 
 ```bash
 node --experimental-strip-types src/mcp.ts

@@ -5,15 +5,16 @@
     "description": "Bookmark manager for git-backed resources.",
     "type": "module",
     "bin": {
-        "gmk": "./bin/gmk.js",
-        "git-mark-mcp": "./bin/git-mark-mcp.js"
+        "gmk": "./dist/cli.js",
+        "git-mark-mcp": "./dist/mcp.js"
     },
     "scripts": {
         "dev": "node --experimental-strip-types src/cli.ts",
         "start": "node --experimental-strip-types src/cli.ts",
         "mcp": "node --experimental-strip-types src/mcp.ts",
-        "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
-        "typecheck": "node ./node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+        "build": "tsc -p tsconfig.json",
+        "prepare": "npm run build",
+        "typecheck": "tsc -p tsconfig.json --noEmit",
         "test": "node --experimental-strip-types --test test/*.test.ts"
     },
     "engines": {
@@ -27,9 +28,8 @@
         "typescript": "^5.9.3"
     },
     "files": [
-        "bin",
-        "src",
+        "dist",
         "README.md",
-        "docs/spec_initial.md"
+        "LICENSE"
     ]
 }

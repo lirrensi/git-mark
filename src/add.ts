@@ -75,7 +75,7 @@ export async function createPromptAdapter(): Promise<PromptAdapter> {
       return askSelect({
         message,
         choices,
-        default: initial === undefined ? undefined : choices.findIndex((choice) => Object.is(choice.value, initial)),
+        default: initial,
       });
     },
   };

@@ -11,7 +11,8 @@ import type { PackageRecord } from './types.ts';
 
 const execFileAsync = promisify(execFile);
 const currentFile = fileURLToPath(import.meta.url);
-const cliEntry = path.join(path.dirname(currentFile), 'cli.ts');
+const isTypeScriptEntry = currentFile.endsWith('.ts');
+const cliEntry = path.join(path.dirname(currentFile), isTypeScriptEntry ? 'cli.ts' : 'cli.js');
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -71,7 +72,8 @@ function tokenizeCommand(input: string): string[] {
 async function runCli(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const args = tokenizeCommand(command);
   try {
-    const result = await execFileAsync(process.execPath, ['--experimental-strip-types', cliEntry, ...args], {
+    const nodeArgs = isTypeScriptEntry ? ['--experimental-strip-types', cliEntry, ...args] : [cliEntry, ...args];
+    const result = await execFileAsync(process.execPath, nodeArgs, {
       encoding: 'utf8',
       env: { ...process.env },
       maxBuffer: 10 * 1024 * 1024,
