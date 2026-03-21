@@ -1,0 +1,742 @@
+import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import {
+  cloneRemote,
+  currentBranch,
+  currentCommit,
+  ensureGitAccessible,
+  fetchRemote,
+  checkoutCommit,
+  resetToRemoteBranch,
+  runGit,
+} from './git.ts';
+import { GitMarkError } from './errors.ts';
+import { ensureDir, pathExists, readTextIfExists, removeIfExists, writeText } from './fs.ts';
+import type {
+  CommandContext,
+  PackageRecord,
+  RepoState,
+  SearchHit,
+  TempState,
+  ToolState,
+} from './types.ts';
+import { parsePackageIndex, stringifyPackageIndex } from './toml.ts';
+import { searchPackages } from './search.ts';
+import type { AddInspection } from './types.ts';
+
+const DEFAULT_MAX_LINES = 1000;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+export function defaultRuntimeConfig() {
+  return {
+    storage: {
+      root: path.join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.gitmark'),
+      temp_root: path.join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.gitmark', 'tmp'),
+      max_temp_size_mb: 2048,
+    },
+    network: {
+      git_timeout_sec: 120,
+      allow_lfs: false,
+    },
+    hooks: {
+      pre_load: '',
+      pre_expose: '',
+      post_load: '',
+      pre_update: '',
+      post_update: '',
+    },
+  };
+}
+
+export function sanitizeId(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9/_-]+/g, '-')
+    .replace(/\/+/g, '/')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'package';
+}
+
+export function normalizeRemoteSource(source: string): string {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source) || source.startsWith('git@') || source.startsWith('ssh://')) {
+    return source;
+  }
+  return `https://${source.replace(/^\/+/, '')}`;
+}
+
+export function parseSourceDescriptor(source: string): { remotes: string[]; subpath?: string } {
+  const [remotePart, subpathPart] = source.split('#', 2);
+  const subpath = subpathPart ? subpathPart.replace(/^\/+|\/+$/g, '') : '';
+  return {
+    remotes: [normalizeRemoteSource(remotePart)],
+    subpath: subpath.length > 0 ? subpath : undefined,
+  };
+}
+
+export function inferPackageId(remote: string, subpath?: string): string {
+  const trimmedRemote = remote.replace(/\/+$/, '').replace(/\.git$/, '');
+  const repoName = trimmedRemote.split('/').pop() ?? 'package';
+  const slug = sanitizeId(repoName);
+  if (!subpath) {
+    return slug;
+  }
+  const leaf = sanitizeId(subpath.split('/').filter(Boolean).pop() ?? subpath);
+  return `${slug}/${leaf}`;
+}
+
+export function ensureUniqueId(records: PackageRecord[], baseId: string): string {
+  const existing = new Set(records.map((record) => record.id));
+  if (!existing.has(baseId)) {
+    return baseId;
+  }
+  let index = 2;
+  while (existing.has(`${baseId}-${index}`)) {
+    index += 1;
+  }
+  return `${baseId}-${index}`;
+}
+
+export function repoKeyFor(record: PackageRecord): string {
+  const normalized = [...record.remotes].map((entry) => entry.trim()).filter(Boolean).sort();
+  const digest = crypto.createHash('sha256').update(normalized.join('\n')).digest('hex');
+  return digest.slice(0, 24);
+}
+
+export async function loadIndexFile(indexPath: string): Promise<PackageRecord[]> {
+  const text = await readTextIfExists(indexPath);
+  if (!text) {
+    return [];
+  }
+  return parsePackageIndex(text);
+}
+
+export async function saveIndexFile(indexPath: string, records: PackageRecord[]): Promise<void> {
+  await writeText(indexPath, stringifyPackageIndex(records));
+}
+
+export async function loadState(statePath: string): Promise<ToolState> {
+  const text = await readTextIfExists(statePath);
+  if (!text) {
+    return { repos: {}, temps: {} };
+  }
+  const parsed = JSON.parse(text) as Partial<ToolState>;
+  return {
+    repos: parsed.repos ?? {},
+    temps: parsed.temps ?? {},
+  };
+}
+
+export async function saveState(statePath: string, state: ToolState): Promise<void> {
+  await writeText(statePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+export async function cleanupTempMaterializations(context: CommandContext): Promise<void> {
+  const state = await loadState(context.paths.statePath);
+  const now = Date.now();
+  let changed = false;
+
+  for (const [id, temp] of Object.entries(state.temps)) {
+    const age = now - new Date(temp.lastAccessedAt).getTime();
+    const missing = !(await pathExists(temp.path));
+    if (missing || Number.isNaN(age) || age > ONE_DAY_MS) {
+      await removeIfExists(temp.path);
+      delete state.temps[id];
+      changed = true;
+    }
+  }
+
+  const maxBytes = context.config.storage.max_temp_size_mb * 1024 * 1024;
+  const totalSize = await calculateDirectorySize(context.paths.tempRoot);
+  if (totalSize > maxBytes) {
+    const orderedTemps = Object.entries(state.temps).sort(
+      (left, right) =>
+        new Date(left[1].lastAccessedAt).getTime() - new Date(right[1].lastAccessedAt).getTime(),
+    );
+    let remaining = totalSize;
+    for (const [id, temp] of orderedTemps) {
+      if (remaining <= maxBytes) {
+        break;
+      }
+      const tempSize = await calculateDirectorySize(temp.path);
+      await removeIfExists(temp.path);
+      delete state.temps[id];
+      remaining -= tempSize;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await saveState(context.paths.statePath, state);
+  }
+}
+
+async function calculateDirectorySize(targetPath: string): Promise<number> {
+  if (!(await pathExists(targetPath))) {
+    return 0;
+  }
+  let total = 0;
+  const entries = await fs.readdir(targetPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryPath = path.join(targetPath, entry.name);
+    if (entry.isDirectory()) {
+      total += await calculateDirectorySize(entryPath);
+    } else {
+      const stat = await fs.stat(entryPath);
+      total += stat.size;
+    }
+  }
+  return total;
+}
+
+async function ensureRepoRoot(context: CommandContext): Promise<void> {
+  await ensureDir(context.paths.storageRoot);
+  await ensureDir(context.paths.reposRoot);
+  await ensureDir(context.paths.tempRoot);
+}
+
+async function resolveCloneTarget(
+  context: CommandContext,
+  record: PackageRecord,
+  materializedPath: string,
+  persistAsRepoState: boolean,
+): Promise<{ repoPath: string; selectedRemote: string; defaultBranch: string; commit: string }> {
+  const repoKey = repoKeyFor(record);
+  await ensureRepoRoot(context);
+  const state = await loadState(context.paths.statePath);
+  const existingRepoState = state.repos[repoKey];
+  if (persistAsRepoState && existingRepoState && (await pathExists(existingRepoState.path))) {
+    const repoPath = existingRepoState.path;
+    const selectedRemote = existingRepoState.selectedRemote || record.remotes[0];
+    const defaultBranch = existingRepoState.defaultBranch;
+    if (record.frozen && record.commit) {
+      await checkoutCommit(repoPath, record.commit);
+    } else if (defaultBranch) {
+      try {
+        await checkoutBranchIfDetached(repoPath, defaultBranch);
+      } catch {
+        // Keep the current checkout if the branch is not available locally yet.
+      }
+    }
+    return {
+      repoPath,
+      selectedRemote,
+      defaultBranch,
+      commit: await currentCommit(repoPath),
+    };
+  }
+
+  await removeIfExists(materializedPath);
+  await ensureDir(path.dirname(materializedPath));
+
+  let lastError: unknown = null;
+  for (const remote of record.remotes) {
+    try {
+      await cloneRemote(remote, materializedPath, context.config.network.allow_lfs);
+      const defaultBranch = await detectDefaultBranch(materializedPath);
+      const commit = await currentCommit(materializedPath);
+      return {
+        repoPath: materializedPath,
+        selectedRemote: remote,
+        defaultBranch,
+        commit,
+      };
+    } catch (error) {
+      lastError = error;
+      await removeIfExists(materializedPath);
+    }
+  }
+
+  throw new GitMarkError(
+    'CLONE_FAILED',
+    `Could not clone any remote for package ${record.id}: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+}
+
+async function checkoutBranchIfDetached(repoPath: string, branch: string): Promise<void> {
+  try {
+    const branchName = await currentBranch(repoPath);
+    if (branchName === branch) {
+      return;
+    }
+  } catch {
+    // Detached HEAD or no branch information.
+  }
+  await runGit(['checkout', '--force', branch], { cwd: repoPath });
+}
+
+async function detectDefaultBranch(repoPath: string): Promise<string> {
+  try {
+    const branch = await currentBranch(repoPath);
+    if (branch) {
+      return branch;
+    }
+  } catch {
+    // Fall through.
+  }
+  const result = await runGit(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], { cwd: repoPath });
+  const ref = result.stdout.trim();
+  return ref.startsWith('origin/') ? ref.slice('origin/'.length) : 'main';
+}
+
+async function resolveVisiblePath(record: PackageRecord, repoPath: string): Promise<string> {
+  const visiblePath = record.subpath ? path.join(repoPath, record.subpath) : repoPath;
+  if (!(await pathExists(visiblePath))) {
+    throw new GitMarkError('SUBPATH_MISSING', `Package ${record.id} does not contain subpath ${record.subpath}.`);
+  }
+  return visiblePath;
+}
+
+export async function addRecord(context: CommandContext, input: string, options: Partial<PackageRecord>): Promise<PackageRecord> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const parsed = parseSourceDescriptor(input);
+  const remote = parsed.remotes[0];
+  const baseId = options.id ?? inferPackageId(remote, parsed.subpath);
+  const id = ensureUniqueId(records, baseId);
+  const record: PackageRecord = {
+    id,
+    remotes: options.remotes ?? parsed.remotes,
+    subpath: options.subpath ?? parsed.subpath,
+    summary: options.summary ?? '',
+    description: options.description ?? '',
+    resources: options.resources ?? [],
+    pinned: options.pinned ?? true,
+    kept: options.kept ?? true,
+    discoverable: options.discoverable ?? true,
+    frozen: options.frozen ?? false,
+    commit: options.commit ?? '',
+  };
+  records.push(record);
+  await saveIndexFile(context.paths.indexPath, records);
+  return record;
+}
+
+export async function listRecords(context: CommandContext, all = false): Promise<PackageRecord[]> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const filtered = all ? records : records.filter((record) => record.pinned !== false);
+  return filtered.slice().sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export async function searchRecords(context: CommandContext, query: string): Promise<SearchHit[]> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  return searchPackages(records, query);
+}
+
+export async function peekRecord(
+  context: CommandContext,
+  id: string,
+): Promise<{ record: PackageRecord; preview: string[]; readme?: string }> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const record = records.find((entry) => entry.id === id);
+  if (!record) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const inspection = await materializeForInspection(context, record);
+  const repoPath = inspection.repoPath;
+  const preview = await previewVisiblePath(repoPath, record.subpath);
+  const readme = await readReadmeExcerpt(record, repoPath);
+  if (inspection.transient) {
+    await removeIfExists(repoPath);
+  }
+  return { record, preview, readme };
+}
+
+export async function inspectAddSource(context: CommandContext, source: string): Promise<AddInspection> {
+  const parsed = parseSourceDescriptor(source);
+  const tempId = `inspect-${sanitizeId(parsed.remotes[0])}-${Date.now()}`;
+  const scratchPath = path.join(context.paths.tempRoot, tempId);
+  const record: PackageRecord = {
+    id: tempId,
+    remotes: parsed.remotes,
+    subpath: parsed.subpath,
+    summary: '',
+    description: '',
+    resources: [],
+    pinned: false,
+    kept: false,
+    discoverable: true,
+    frozen: false,
+    commit: '',
+  };
+
+  try {
+    await ensureGitAccessible();
+    const clone = await resolveCloneTarget(context, record, scratchPath, false);
+    const preview = await previewVisiblePath(clone.repoPath, parsed.subpath);
+    const readmeExcerpt = await readReadmeExcerpt(record, clone.repoPath);
+    return {
+      source,
+      remote: parsed.remotes[0],
+      subpath: parsed.subpath,
+      preview,
+      readmeExcerpt,
+    };
+  } finally {
+    await removeIfExists(scratchPath);
+  }
+}
+
+async function materializeForInspection(
+  context: CommandContext,
+  record: PackageRecord,
+): Promise<{ repoPath: string; transient: boolean }> {
+  await ensureGitAccessible();
+  const repoKey = repoKeyFor(record);
+  const state = await loadState(context.paths.statePath);
+  if (record.kept && state.repos[repoKey] && (await pathExists(state.repos[repoKey].path))) {
+    return { repoPath: state.repos[repoKey].path, transient: false };
+  }
+  if (!record.kept && state.temps[record.id] && (await pathExists(state.temps[record.id].path))) {
+    state.temps[record.id].lastAccessedAt = new Date().toISOString();
+    await saveState(context.paths.statePath, state);
+    return { repoPath: state.temps[record.id].path, transient: false };
+  }
+  const scratchPath = path.join(context.paths.tempRoot, `peek-${sanitizeId(record.id)}-${Date.now()}`);
+  const clone = await resolveCloneTarget(context, record, scratchPath, false);
+  if (record.frozen && record.commit) {
+    await checkoutCommit(clone.repoPath, record.commit);
+  }
+  return { repoPath: clone.repoPath, transient: true };
+}
+
+export async function loadRecord(context: CommandContext, id: string): Promise<string> {
+  await ensureGitAccessible();
+  const records = await loadIndexFile(context.paths.indexPath);
+  const record = records.find((entry) => entry.id === id);
+  if (!record) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const plannedPath = plannedMaterializationPath(context, record);
+  await runHooks(context, 'pre_load', record, plannedPath, record.remotes[0], '');
+  const state = await loadState(context.paths.statePath);
+  if (record.kept) {
+    const repoKey = repoKeyFor(record);
+    const repoPath = path.join(context.paths.reposRoot, repoKey);
+    const clone = await resolveCloneTarget(context, record, repoPath, true);
+    if (record.frozen && record.commit) {
+      await checkoutCommit(clone.repoPath, record.commit);
+    }
+    if (!record.frozen && clone.defaultBranch) {
+      await checkoutBranchIfDetached(clone.repoPath, clone.defaultBranch);
+    }
+    state.repos[repoKey] = {
+      path: clone.repoPath,
+      selectedRemote: clone.selectedRemote,
+      defaultBranch: clone.defaultBranch,
+      lastCommit: await currentCommit(clone.repoPath),
+      updatedAt: new Date().toISOString(),
+    };
+    await saveState(context.paths.statePath, state);
+    await runHooks(context, 'pre_expose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+    await runHooks(context, 'post_load', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+    return resolveVisiblePath(record, clone.repoPath);
+  }
+
+  const existingTemp = state.temps[record.id];
+  if (existingTemp && (await pathExists(existingTemp.path))) {
+    existingTemp.lastAccessedAt = new Date().toISOString();
+    if (record.frozen && record.commit) {
+      await checkoutCommit(existingTemp.path, record.commit);
+    }
+    await saveState(context.paths.statePath, state);
+    await runHooks(context, 'pre_expose', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
+    await runHooks(context, 'post_load', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
+    return resolveVisiblePath(record, existingTemp.path);
+  }
+
+  const tempPath = path.join(context.paths.tempRoot, `${sanitizeId(record.id)}-${Date.now()}`);
+  const clone = await resolveCloneTarget(context, record, tempPath, false);
+  if (record.frozen && record.commit) {
+    await checkoutCommit(clone.repoPath, record.commit);
+  }
+  state.temps[record.id] = {
+    path: clone.repoPath,
+    repoKey: repoKeyFor(record),
+    selectedRemote: clone.selectedRemote,
+    defaultBranch: clone.defaultBranch,
+    materializedAt: new Date().toISOString(),
+    lastAccessedAt: new Date().toISOString(),
+  };
+  await saveState(context.paths.statePath, state);
+  await runHooks(context, 'pre_expose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+  await runHooks(context, 'post_load', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+  return resolveVisiblePath(record, clone.repoPath);
+}
+
+export async function currentPath(context: CommandContext, id: string): Promise<string> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const record = records.find((entry) => entry.id === id);
+  if (!record) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const state = await loadState(context.paths.statePath);
+  if (record.kept) {
+    const repoKey = repoKeyFor(record);
+    const repoState = state.repos[repoKey];
+    if (!repoState || !(await pathExists(repoState.path))) {
+      throw new GitMarkError('NOT_MATERIALIZED', `Package ${id} is not materialized. Use gmk load ${id}.`);
+    }
+    return resolveVisiblePath(record, repoState.path);
+  }
+  const tempState = state.temps[record.id];
+  if (!tempState || !(await pathExists(tempState.path))) {
+    throw new GitMarkError('NOT_MATERIALIZED', `Package ${id} is not materialized. Use gmk load ${id}.`);
+  }
+  return resolveVisiblePath(record, tempState.path);
+}
+
+export async function updateRecord(context: CommandContext, id: string, force = false): Promise<string> {
+  await ensureGitAccessible();
+  const records = await loadIndexFile(context.paths.indexPath);
+  const record = records.find((entry) => entry.id === id);
+  if (!record) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  if (record.frozen && !force) {
+    throw new GitMarkError('FROZEN', `Package ${id} is frozen and was skipped.`);
+  }
+  await loadRecord(context, id);
+  const repoPath = await currentCloneRoot(context, record);
+  const state = await loadState(context.paths.statePath);
+  const repoKey = repoKeyFor(record);
+  const repoState = record.kept ? state.repos[repoKey] : state.temps[record.id];
+  const selectedRemote = repoState?.selectedRemote ?? record.remotes[0];
+  const defaultBranch = repoState?.defaultBranch ?? 'main';
+  await runHooks(context, 'pre_update', record, repoPath, selectedRemote, defaultBranch);
+  await fetchRemote(repoPath, 'origin', context.config.network.allow_lfs);
+  await resetToRemoteBranch(repoPath, defaultBranch, 'origin');
+  if (record.frozen && record.commit) {
+    await checkoutCommit(repoPath, record.commit);
+  }
+  const commit = await currentCommit(repoPath);
+  if (record.kept) {
+    state.repos[repoKey] = {
+      path: repoPath,
+      selectedRemote,
+      defaultBranch,
+      lastCommit: commit,
+      updatedAt: new Date().toISOString(),
+    };
+  } else {
+    const tempState = repoState as TempState | undefined;
+    state.temps[record.id] = {
+      path: repoPath,
+      repoKey,
+      selectedRemote,
+      defaultBranch,
+      materializedAt: tempState?.materializedAt ?? new Date().toISOString(),
+      lastAccessedAt: new Date().toISOString(),
+    };
+  }
+  await saveState(context.paths.statePath, state);
+  await runHooks(context, 'post_update', record, repoPath, selectedRemote, defaultBranch);
+  return resolveVisiblePath(record, repoPath);
+}
+
+async function currentCloneRoot(context: CommandContext, record: PackageRecord): Promise<string> {
+  const state = await loadState(context.paths.statePath);
+  if (record.kept) {
+    const repoKey = repoKeyFor(record);
+    const repoState = state.repos[repoKey];
+    if (!repoState) {
+      throw new GitMarkError('NOT_MATERIALIZED', `Package ${record.id} is not materialized. Use gmk load ${record.id}.`);
+    }
+    return repoState.path;
+  }
+  const tempState = state.temps[record.id];
+  if (!tempState) {
+    throw new GitMarkError('NOT_MATERIALIZED', `Package ${record.id} is not materialized. Use gmk load ${record.id}.`);
+  }
+  return tempState.path;
+}
+
+export async function freezeRecord(context: CommandContext, id: string): Promise<PackageRecord> {
+  await ensureGitAccessible();
+  const records = await loadIndexFile(context.paths.indexPath);
+  const index = records.findIndex((entry) => entry.id === id);
+  if (index === -1) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const record = records[index];
+  const pathOnDisk = await loadRecord(context, id);
+  const commit = await currentCommit(pathOnDisk);
+  record.frozen = true;
+  record.commit = commit;
+  records[index] = record;
+  await saveIndexFile(context.paths.indexPath, records);
+  return record;
+}
+
+export async function unfreezeRecord(context: CommandContext, id: string): Promise<PackageRecord> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const index = records.findIndex((entry) => entry.id === id);
+  if (index === -1) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const record = records[index];
+  record.frozen = false;
+  record.commit = '';
+  records[index] = record;
+  await saveIndexFile(context.paths.indexPath, records);
+  return record;
+}
+
+export async function pinRecord(context: CommandContext, id: string): Promise<PackageRecord> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const index = records.findIndex((entry) => entry.id === id);
+  if (index === -1) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const record = records[index];
+  record.pinned = true;
+  records[index] = record;
+  await saveIndexFile(context.paths.indexPath, records);
+  return record;
+}
+
+export async function unpinRecord(context: CommandContext, id: string): Promise<PackageRecord> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const index = records.findIndex((entry) => entry.id === id);
+  if (index === -1) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const record = records[index];
+  record.pinned = false;
+  records[index] = record;
+  await saveIndexFile(context.paths.indexPath, records);
+  return record;
+}
+
+export async function updateAllRecords(context: CommandContext): Promise<number> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  let count = 0;
+  for (const record of records) {
+    if (record.frozen) {
+      continue;
+    }
+    await updateRecord(context, record.id, true);
+    count += 1;
+  }
+  return count;
+}
+
+export async function previewVisiblePath(repoPath: string, subpath?: string): Promise<string[]> {
+  const base = subpath ? path.join(repoPath, subpath) : repoPath;
+  if (!(await pathExists(base))) {
+    return [];
+  }
+  const entries = await listDirectoryPreview(base, 2, 24);
+  return entries;
+}
+
+async function listDirectoryPreview(targetPath: string, depth: number, limit: number): Promise<string[]> {
+  const entries: string[] = [];
+
+  async function walk(currentPath: string, currentDepth: number, prefix: string): Promise<void> {
+    if (entries.length >= limit || currentDepth < 0) {
+      return;
+    }
+    const items = await fs.readdir(currentPath, { withFileTypes: true });
+    for (const item of items) {
+      if (entries.length >= limit) {
+        break;
+      }
+      const relative = prefix ? `${prefix}/${item.name}` : item.name;
+      entries.push(item.isDirectory() ? `${relative}/` : relative);
+      if (item.isDirectory() && currentDepth > 0) {
+        await walk(path.join(currentPath, item.name), currentDepth - 1, relative);
+      }
+    }
+  }
+
+  await walk(targetPath, depth, '');
+  return entries;
+}
+
+async function readReadmeExcerpt(record: PackageRecord, repoPath: string): Promise<string | undefined> {
+  const candidates = [path.join(repoPath, 'README.md'), path.join(repoPath, 'README'), path.join(repoPath, 'readme.md')];
+  if (record.subpath) {
+    candidates.unshift(
+      path.join(repoPath, record.subpath, 'README.md'),
+      path.join(repoPath, record.subpath, 'README'),
+      path.join(repoPath, record.subpath, 'readme.md'),
+    );
+  }
+  for (const candidate of candidates) {
+    if (!(await pathExists(candidate))) {
+      continue;
+    }
+    const text = await fs.readFile(candidate, 'utf8');
+    const excerpt = text.slice(0, 1000).replace(/\s+/g, ' ').trim();
+    return excerpt.length > 0 ? excerpt : undefined;
+  }
+  return undefined;
+}
+
+export async function runHooks(
+  context: CommandContext,
+  hookName: keyof CommandContext['config']['hooks'],
+  record: PackageRecord,
+  repoPath: string,
+  selectedRemote: string,
+  defaultBranch: string,
+): Promise<void> {
+  const command = context.config.hooks[hookName];
+  if (!command) {
+    return;
+  }
+  const env = {
+    ...process.env,
+    GMK_ID: record.id,
+    GMK_REPO_PATH: repoPath,
+    GMK_REMOTE: selectedRemote,
+    GMK_SUBPATH: record.subpath ?? '',
+    GMK_COMMIT: record.commit ?? '',
+    GMK_BRANCH: defaultBranch,
+  };
+  const cwd = hookName === 'pre_load' ? path.dirname(repoPath) : repoPath;
+  await runShellCommand(command, cwd, env);
+}
+
+async function runShellCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn('sh', ['-lc', command], {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (error) => {
+      reject(new GitMarkError('HOOK_FAILED', `Hook could not start: ${error.message}`));
+    });
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new GitMarkError('HOOK_FAILED', `Hook failed with exit code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
+    });
+  });
+}
+
+function plannedMaterializationPath(context: CommandContext, record: PackageRecord): string {
+  if (record.kept) {
+    return path.join(context.paths.reposRoot, repoKeyFor(record));
+  }
+  return path.join(context.paths.tempRoot, `${sanitizeId(record.id)}-${Date.now()}`);
+}
+
+export async function resolveIndexAndConfig(context: CommandContext): Promise<{ records: PackageRecord[]; state: ToolState }> {
+  return {
+    records: await loadIndexFile(context.paths.indexPath),
+    state: await loadState(context.paths.statePath),
+  };
+}
+
+export async function ensureGitAvailableOrThrow(): Promise<void> {
+  await ensureGitAccessible();
+}

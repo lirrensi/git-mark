@@ -1,0 +1,35 @@
+{
+    "name": "git-mark",
+    "version": "0.2.0",
+    "private": false,
+    "description": "Bookmark manager for git-backed resources.",
+    "type": "module",
+    "bin": {
+        "gmk": "./bin/gmk.js",
+        "git-mark-mcp": "./bin/git-mark-mcp.js"
+    },
+    "scripts": {
+        "dev": "node --experimental-strip-types src/cli.ts",
+        "start": "node --experimental-strip-types src/cli.ts",
+        "mcp": "node --experimental-strip-types src/mcp.ts",
+        "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
+        "typecheck": "node ./node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+        "test": "node --experimental-strip-types --test test/*.test.ts"
+    },
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "dependencies": {
+        "@inquirer/prompts": "^8.3.2"
+    },
+    "devDependencies": {
+        "@types/node": "^25.5.0",
+        "typescript": "^5.9.3"
+    },
+    "files": [
+        "bin",
+        "src",
+        "README.md",
+        "docs/spec_initial.md"
+    ]
+}
