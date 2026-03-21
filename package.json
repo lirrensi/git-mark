@@ -5,6 +5,7 @@
     "description": "Bookmark manager for git-backed resources.",
     "type": "module",
     "bin": {
+        "git-mark": "./bin/gmk.cjs",
         "gmk": "./bin/gmk.cjs",
         "git-mark-mcp": "./bin/git-mark-mcp.cjs"
     },

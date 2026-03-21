@@ -65,6 +65,7 @@ Install globally from GitHub:
 ```bash
 npm install -g github:lirrensi/git-mark
 gmk help
+git-mark help
 ```
 
 ### pnpm
@@ -72,6 +73,7 @@ gmk help
 ```bash
 pnpm add -g github:lirrensi/git-mark
 gmk help
+git-mark help
 ```
 
 After a global install, the MCP server binary is still `git-mark-mcp`.
@@ -98,6 +100,7 @@ node --import tsx src/mcp.ts
 
 Available binaries:
 
+- `git-mark` - full command alias for the CLI entry point
 - `gmk` - CLI entry point
 - `git-mark-mcp` - MCP server entry point
 

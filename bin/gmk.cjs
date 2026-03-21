@@ -4,7 +4,8 @@ const { spawnSync } = require("node:child_process");
 const path = require("node:path");
 
 const entry = path.join(__dirname, "..", "src", "cli.ts");
-const result = spawnSync(process.execPath, ["--import", "tsx", entry, ...process.argv.slice(2)], {
+const tsxCli = require.resolve("tsx/cli");
+const result = spawnSync(process.execPath, [tsxCli, entry, ...process.argv.slice(2)], {
   stdio: "inherit",
 });
 
