@@ -95,6 +95,11 @@ export interface AddInspection {
   readmeExcerpt?: string;
 }
 
+export interface PackageSourceIdentity {
+  remote: string;
+  subpath?: string;
+}
+
 export interface AddDraft {
   summary: string;
   description: string;
@@ -107,4 +112,40 @@ export interface AddDraft {
 export interface CommandContext {
   paths: ToolPaths;
   config: RuntimeConfig;
+}
+
+export interface ReconcileRuntimeOptions {
+  pruneOrphanRepoDirectories?: boolean;
+  pruneOrphanTempDirectories?: boolean;
+  clearTrackedTemps?: boolean;
+}
+
+export interface ReconcileRuntimeReport {
+  removedTempStateEntries: number;
+  removedRepoStateEntries: number;
+  deletedTempDirectories: number;
+  deletedRepoDirectories: number;
+  clearedTrackedTempStateEntries: number;
+}
+
+export interface RemoveRecordResult {
+  removedId: string;
+  deletedTempStateEntries: number;
+  deletedRepoStateEntries: number;
+  deletedTempDirectories: number;
+  deletedRepoDirectories: number;
+  reconciliation: ReconcileRuntimeReport;
+}
+
+export interface SyncRecordsResult {
+  keptPackagesProcessed: number;
+  reconciliation: ReconcileRuntimeReport;
+}
+
+export interface CleanupResult extends ReconcileRuntimeReport {}
+
+export interface DoctorReport {
+  clean: boolean;
+  issues: string[];
+  lockStatus: 'absent' | 'active' | 'stale';
 }

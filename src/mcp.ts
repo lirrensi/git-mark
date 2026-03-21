@@ -7,6 +7,7 @@ import { ensureToolDirectories, getBootstrapPaths, resolveToolPaths } from './en
 import { ensureConfigFile, loadRuntimeConfig } from './config.ts';
 import { loadIndexFile } from './index.ts';
 import { getMcpToolDescription } from './help.ts';
+import type { PackageRecord } from './types.ts';
 
 const execFileAsync = promisify(execFile);
 const currentFile = fileURLToPath(import.meta.url);
@@ -91,8 +92,13 @@ async function runCli(command: string): Promise<{ stdout: string; stderr: string
 }
 
 async function buildToolDescription(): Promise<string> {
-  const result = await runCli('list');
-  return getMcpToolDescription(result.stdout);
+  const bootstrapPaths = getBootstrapPaths();
+  const records = await loadIndexFile(bootstrapPaths.indexPath);
+  const pinnedRecords: PackageRecord[] = records
+    .filter((record) => record.pinned !== false)
+    .slice()
+    .sort((left, right) => left.id.localeCompare(right.id));
+  return getMcpToolDescription(pinnedRecords);
 }
 
 async function handleRequest(request: JsonRpcRequest): Promise<JsonRpcResponse | null> {

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { resolveToolPaths } from '../src/env.ts';
-import { loadState, runHooks } from '../src/index.ts';
+import { defaultRuntimeConfig, loadState, runHooks } from '../src/index.ts';
 import type { CommandContext, PackageRecord } from '../src/types.ts';
 
 function makeContext(root: string, hookModulePath = ''): CommandContext {
@@ -26,7 +26,7 @@ function makeContext(root: string, hookModulePath = ''): CommandContext {
         max_temp_size_mb: 64,
       },
       network: {
-        git_timeout_sec: 120,
+        git_timeout_sec: 180,
         allow_lfs: false,
       },
       hooks: {
@@ -49,7 +49,7 @@ test('effective runtime paths honor loaded storage roots', () => {
       max_temp_size_mb: 64,
     },
     network: {
-      git_timeout_sec: 120,
+      git_timeout_sec: 180,
       allow_lfs: false,
     },
     hooks: {
@@ -63,6 +63,11 @@ test('effective runtime paths honor loaded storage roots', () => {
   assert.equal(paths.logPath, path.join('/var/lib/gitmark-data', 'history.log'));
   assert.equal(paths.statePath, path.join('/var/lib/gitmark-data', 'state.json'));
   assert.equal(paths.tempRoot, '/var/tmp/gitmark-scratch');
+});
+
+test('default runtime config uses a 180 second git timeout', () => {
+  const config = defaultRuntimeConfig();
+  assert.equal(config.network.git_timeout_sec, 180);
 });
 
 test('TypeScript hook modules load and receive hook context', async () => {

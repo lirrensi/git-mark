@@ -59,6 +59,8 @@ export interface PromptAdapter {
   select<T>(message: string, choices: Array<{ name: string; value: T }>, initial?: T): Promise<T>;
 }
 
+export type DuplicateAddResolution = 'replace' | 'keep-both' | 'cancel';
+
 export async function createPromptAdapter(): Promise<PromptAdapter> {
   const { input: askInput, select: askSelect } = await import('@inquirer/prompts');
   return {
@@ -84,9 +86,7 @@ export async function collectAddDraft(
   defaults: Partial<AddDraft>,
   prompt: PromptAdapter,
 ): Promise<AddDraft> {
-  const summary = defaults.summary !== undefined
-    ? defaults.summary
-    : await prompt.input('Summary (leave blank to keep empty)', '');
+  const summary = await prompt.input('Summary (leave blank to keep empty)', defaults.summary ?? '');
   let description = defaults.description ?? '';
   if (defaults.description === undefined) {
     if (inspection.readmeExcerpt) {
@@ -138,4 +138,32 @@ export async function collectAddDraft(
     kept,
     discoverable,
   };
+}
+
+export async function resolveDuplicateAdd(prompt: PromptAdapter, existingId: string): Promise<DuplicateAddResolution> {
+  return prompt.select(
+    `Package already exists as ${existingId}`,
+    [
+      { name: 'Replace the existing record', value: 'replace' },
+      { name: 'Keep both under another id', value: 'keep-both' },
+      { name: 'Cancel', value: 'cancel' },
+    ],
+    'replace',
+  );
+}
+
+export async function promptForUniqueId(
+  prompt: PromptAdapter,
+  suggestedId: string,
+  existingIds: Iterable<string>,
+): Promise<string> {
+  const takenIds = new Set(existingIds);
+  let message = 'Package id';
+  for (;;) {
+    const chosenId = await prompt.input(message, suggestedId);
+    if (!takenIds.has(chosenId)) {
+      return chosenId;
+    }
+    message = 'Package id already exists; choose another id';
+  }
 }

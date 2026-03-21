@@ -257,11 +257,22 @@ This keeps update behavior simple and preserves normal repo behavior such as sym
 
 Temp cleanup is synchronous and tool-managed.
 
-- cleanup runs at the start of each CLI invocation
+- cleanup runs immediately before mutating operations while the single-writer lock is held
 - stale temp materializations are removed first
 - the tool updates its own temp-state tracking so removed temp paths are no longer treated as live
-- after cleanup, the requested command runs normally
+- after cleanup, the requested mutating command runs normally
 - `gmk load <id>` is the repair operation that re-materializes a temp package if cleanup just removed it
+
+### Writer coordination
+
+Mutating operations use one filesystem-backed writer lock under the runtime storage root.
+
+- `add`, `peek`, `load`, `update`, `updateall`, `pin`, `unpin`, `freeze`, and `unfreeze` acquire the lock before mutating tool-managed state
+- contending writers wait for the active writer instead of failing immediately
+- waiting stops after about 60 seconds and returns a retryable error
+- the lock keeps a heartbeat file and owner metadata for stale-lock recovery and diagnostics
+- if the heartbeat expires, the next writer automatically reaps the stale lock and retries acquisition
+- read-only commands such as `list`, `list-all`, `search`, `path`, help, and version do not need the writer lock
 
 ### Tool-owned runtime state
 
@@ -293,19 +304,19 @@ The tool supports three levels of discovery:
 
 - `gmk search <query>` searches across all discoverable packages.
 - by default it returns the first `10` matches, with paging available through limit and offset flags
-- Search should use `summary`, `description`, and `resources`.
+- Search indexes `id`, `summary`, `description`, and `resources`.
 - Packages with `discoverable = false` are omitted from search results but remain directly addressable by `id`.
 
 ### Search method
 
 Search in v0.2 is lexical, not semantic.
 
-- the recommended default is a BM25-style full-text ranking method or an equivalent keyword-ranking algorithm
-- search indexes text from `summary`, `description`, and `resources`
-- `summary` should receive the highest weight because it is the strongest short intent signal
-- `description` should receive medium weight
-- `resources` should receive lower but still meaningful weight
-- exact or near-exact `id` matches should rank very highly
+- the implementation uses an in-repo BM25-style weighted lexical ranker
+- search indexes text from `id`, `summary`, `description`, and `resources`
+- `id` receives the strongest weight so direct lookups dominate obvious matches
+- `summary` receives strong weight, `description` medium weight, and `resources` lower weight
+- exact token matches, prefix matches, and light fuzzy matching are supported for usability
+- deterministic tie-breaking falls back to package `id`
 
 This is intended to be accurate enough for large personal indexes without requiring embeddings, external services, or heavier semantic infrastructure.
 
@@ -317,6 +328,8 @@ The search implementation should do lightweight normalization.
 - punctuation-insensitive tokenization where practical
 - reasonable token splitting on paths, dashes, and underscores
 - support for multi-word queries
+- support for prefix completion on partial tokens
+- support for modest typo tolerance when exact lexical matches are sparse
 
 The goal is not perfect information retrieval, only strong enough keyword search for hundreds or thousands of saved entries.
 
@@ -325,7 +338,7 @@ The goal is not perfect information retrieval, only strong enough keyword search
 - no semantic vector search
 - no embedding index
 - no external search service requirement
-- no promise of typo tolerance beyond simple normalization unless explicitly added later
+- no embeddings or external semantic infrastructure
 
 ---
 
@@ -397,7 +410,7 @@ Its job is to answer two questions:
 
 ### Behavior
 
-- before doing anything else, `load` performs normal synchronous temp cleanup
+- before doing anything else, `load` joins the single-writer queue and performs normal synchronous temp cleanup inside that lock
 - if `kept = true` and a valid local view already exists, return that path
 - if `kept = true` and local view is missing, fetch and materialize it, then return the path
 - if `kept = false`, materialize into temp storage and return the temp path

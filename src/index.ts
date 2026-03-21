@@ -17,22 +17,32 @@ import { GitMarkError } from './errors.ts';
 import { ensureDir, pathExists, readTextIfExists, removeIfExists, writeTextAtomic } from './fs.ts';
 import type {
   CommandContext,
+  CleanupResult,
+  DoctorReport,
   HookContext,
   HookName,
   PackageRecord,
+  PackageSourceIdentity,
+  ReconcileRuntimeOptions,
+  ReconcileRuntimeReport,
   RepoState,
+  RemoveRecordResult,
   SearchHit,
+  SyncRecordsResult,
   TempState,
   ToolState,
+  RuntimeConfig,
 } from './types.ts';
 import { parsePackageIndex, stringifyPackageIndex } from './toml.ts';
 import { countSearchPackages, searchPackages } from './search.ts';
 import type { AddInspection } from './types.ts';
+import { inspectWriterLock } from './lock.ts';
 
 const DEFAULT_MAX_LINES = 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PREVIEW_LIMIT = 12;
 const DEFAULT_README_EXCERPT_LENGTH = 400;
+const DEFAULT_GIT_TIMEOUT_MS = 180_000;
 
 export function defaultRuntimeConfig() {
   return {
@@ -42,13 +52,21 @@ export function defaultRuntimeConfig() {
       max_temp_size_mb: 2048,
     },
     network: {
-      git_timeout_sec: 120,
+      git_timeout_sec: 180,
       allow_lfs: false,
     },
     hooks: {
       module: '',
     },
   };
+}
+
+function getRuntimeGitTimeoutMs(config: RuntimeConfig): number {
+  const timeoutSeconds = Number(config.network.git_timeout_sec);
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+    return DEFAULT_GIT_TIMEOUT_MS;
+  }
+  return Math.round(timeoutSeconds * 1000);
 }
 
 export function sanitizeId(input: string): string {
@@ -97,6 +115,29 @@ export function ensureUniqueId(records: PackageRecord[], baseId: string): string
     index += 1;
   }
   return `${baseId}-${index}`;
+}
+
+export function normalizeSourceRemote(remote: string): string {
+  return normalizeRemoteSource(remote.trim()).replace(/\/+$/g, '').replace(/\.git$/i, '');
+}
+
+export function normalizeSourceSubpath(subpath?: string): string | undefined {
+  const normalized = (subpath ?? '').trim().replace(/^\/+|\/+$/g, '');
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+export function findSamePackageRecord(
+  records: PackageRecord[],
+  source: PackageSourceIdentity,
+): PackageRecord | undefined {
+  const normalizedRemote = normalizeSourceRemote(source.remote);
+  const normalizedSubpath = normalizeSourceSubpath(source.subpath);
+  return records.find((record) => {
+    if (normalizeSourceSubpath(record.subpath) !== normalizedSubpath) {
+      return false;
+    }
+    return record.remotes.some((remote) => normalizeSourceRemote(remote) === normalizedRemote);
+  });
 }
 
 export function repoKeyFor(record: PackageRecord): string {
@@ -210,12 +251,180 @@ async function ensureRepoRoot(context: CommandContext): Promise<void> {
   await ensureDir(context.paths.tempRoot);
 }
 
+async function listDirectoryNames(targetPath: string): Promise<string[]> {
+  if (!(await pathExists(targetPath))) {
+    return [];
+  }
+  const entries = await fs.readdir(targetPath, { withFileTypes: true });
+  return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+}
+
+interface RuntimeDriftSnapshot {
+  records: PackageRecord[];
+  state: ToolState;
+  expectedPackageIds: Set<string>;
+  expectedKeptRepoKeys: Set<string>;
+  orphanTempStateEntries: Array<{ id: string; path: string; missingPath: boolean }>;
+  orphanRepoStateEntries: Array<{ repoKey: string; path: string; missingPath: boolean }>;
+  missingKeptMaterializations: Array<{ id: string; repoKey: string }>;
+  orphanTempDirectories: string[];
+  orphanRepoDirectories: string[];
+}
+
+async function collectRuntimeDriftSnapshot(context: CommandContext): Promise<RuntimeDriftSnapshot> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const state = await loadState(context.paths.statePath);
+  const expectedPackageIds = new Set(records.map((record) => record.id));
+  const keptRecords = records.filter((record) => record.kept);
+  const expectedKeptRepoKeys = new Set(keptRecords.map((record) => repoKeyFor(record)));
+
+  const orphanTempStateEntries: Array<{ id: string; path: string; missingPath: boolean }> = [];
+  for (const [id, temp] of Object.entries(state.temps)) {
+    const missingPath = !(await pathExists(temp.path));
+    if (!expectedPackageIds.has(id) || missingPath) {
+      orphanTempStateEntries.push({ id, path: temp.path, missingPath });
+    }
+  }
+
+  const orphanRepoStateEntries: Array<{ repoKey: string; path: string; missingPath: boolean }> = [];
+  for (const [repoKey, repo] of Object.entries(state.repos)) {
+    const missingPath = !(await pathExists(repo.path));
+    if (!expectedKeptRepoKeys.has(repoKey) || missingPath) {
+      orphanRepoStateEntries.push({ repoKey, path: repo.path, missingPath });
+    }
+  }
+
+  const missingKeptMaterializations: Array<{ id: string; repoKey: string }> = [];
+  for (const record of keptRecords) {
+    const repoKey = repoKeyFor(record);
+    const repoState = state.repos[repoKey];
+    if (!repoState || !(await pathExists(repoState.path))) {
+      missingKeptMaterializations.push({ id: record.id, repoKey });
+    }
+  }
+
+  const liveTempPaths = new Set(
+    Object.values(state.temps)
+      .map((temp) => temp.path)
+      .filter((tempPath) => path.dirname(tempPath) === context.paths.tempRoot),
+  );
+  const liveRepoDirectories = new Set<string>();
+  for (const [repoKey, repo] of Object.entries(state.repos)) {
+    if (path.dirname(repo.path) === context.paths.reposRoot) {
+      liveRepoDirectories.add(path.basename(repo.path));
+      continue;
+    }
+    if (expectedKeptRepoKeys.has(repoKey)) {
+      liveRepoDirectories.add(repoKey);
+    }
+  }
+  for (const repoKey of expectedKeptRepoKeys) {
+    liveRepoDirectories.add(repoKey);
+  }
+
+  const orphanTempDirectories = (await listDirectoryNames(context.paths.tempRoot))
+    .map((name) => path.join(context.paths.tempRoot, name))
+    .filter((directoryPath) => !liveTempPaths.has(directoryPath));
+  const orphanRepoDirectories = (await listDirectoryNames(context.paths.reposRoot)).filter(
+    (name) => !liveRepoDirectories.has(name),
+  );
+
+  return {
+    records,
+    state,
+    expectedPackageIds,
+    expectedKeptRepoKeys,
+    orphanTempStateEntries,
+    orphanRepoStateEntries,
+    missingKeptMaterializations,
+    orphanTempDirectories,
+    orphanRepoDirectories,
+  };
+}
+
+export async function reconcileRuntimeState(
+  context: CommandContext,
+  options: ReconcileRuntimeOptions = {},
+): Promise<ReconcileRuntimeReport> {
+  const snapshot = await collectRuntimeDriftSnapshot(context);
+  const report: ReconcileRuntimeReport = {
+    removedTempStateEntries: 0,
+    removedRepoStateEntries: 0,
+    deletedTempDirectories: 0,
+    deletedRepoDirectories: 0,
+    clearedTrackedTempStateEntries: 0,
+  };
+  let changed = false;
+
+  for (const tempEntry of snapshot.orphanTempStateEntries) {
+    if (options.pruneOrphanTempDirectories && (await pathExists(tempEntry.path))) {
+      await removeIfExists(tempEntry.path);
+      report.deletedTempDirectories += 1;
+    }
+    if (snapshot.state.temps[tempEntry.id]) {
+      delete snapshot.state.temps[tempEntry.id];
+      report.removedTempStateEntries += 1;
+      changed = true;
+    }
+  }
+
+  if (options.clearTrackedTemps) {
+    for (const [id, temp] of Object.entries(snapshot.state.temps)) {
+      if (await pathExists(temp.path)) {
+        await removeIfExists(temp.path);
+        report.deletedTempDirectories += 1;
+      }
+      delete snapshot.state.temps[id];
+      report.clearedTrackedTempStateEntries += 1;
+      changed = true;
+    }
+  }
+
+  for (const repoEntry of snapshot.orphanRepoStateEntries) {
+    if (options.pruneOrphanRepoDirectories && (await pathExists(repoEntry.path))) {
+      await removeIfExists(repoEntry.path);
+      report.deletedRepoDirectories += 1;
+    }
+    if (snapshot.state.repos[repoEntry.repoKey]) {
+      delete snapshot.state.repos[repoEntry.repoKey];
+      report.removedRepoStateEntries += 1;
+      changed = true;
+    }
+  }
+
+  if (options.pruneOrphanTempDirectories) {
+    for (const orphanPath of snapshot.orphanTempDirectories) {
+      if (await pathExists(orphanPath)) {
+        await removeIfExists(orphanPath);
+        report.deletedTempDirectories += 1;
+      }
+    }
+  }
+
+  if (options.pruneOrphanRepoDirectories) {
+    for (const orphanName of snapshot.orphanRepoDirectories) {
+      const orphanPath = path.join(context.paths.reposRoot, orphanName);
+      if (await pathExists(orphanPath)) {
+        await removeIfExists(orphanPath);
+        report.deletedRepoDirectories += 1;
+      }
+    }
+  }
+
+  if (changed) {
+    await saveState(context.paths.statePath, snapshot.state);
+  }
+
+  return report;
+}
+
 async function resolveCloneTarget(
   context: CommandContext,
   record: PackageRecord,
   materializedPath: string,
   persistAsRepoState: boolean,
 ): Promise<{ repoPath: string; selectedRemote: string; defaultBranch: string; commit: string }> {
+  const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
   const repoKey = repoKeyFor(record);
   await ensureRepoRoot(context);
   const state = await loadState(context.paths.statePath);
@@ -225,10 +434,10 @@ async function resolveCloneTarget(
     const selectedRemote = existingRepoState.selectedRemote || record.remotes[0];
     const defaultBranch = existingRepoState.defaultBranch;
     if (record.frozen && record.commit) {
-      await checkoutCommit(repoPath, record.commit);
+      await checkoutCommit(repoPath, record.commit, gitTimeoutMs);
     } else if (defaultBranch) {
       try {
-        await checkoutBranchIfDetached(repoPath, defaultBranch);
+        await checkoutBranchIfDetached(repoPath, defaultBranch, gitTimeoutMs);
       } catch {
         // Keep the current checkout if the branch is not available locally yet.
       }
@@ -237,7 +446,7 @@ async function resolveCloneTarget(
       repoPath,
       selectedRemote,
       defaultBranch,
-      commit: await currentCommit(repoPath),
+      commit: await currentCommit(repoPath, gitTimeoutMs),
     };
   }
 
@@ -247,9 +456,9 @@ async function resolveCloneTarget(
   let lastError: unknown = null;
   for (const remote of record.remotes) {
     try {
-      await cloneRemote(remote, materializedPath, context.config.network.allow_lfs);
-      const defaultBranch = await detectDefaultBranch(materializedPath);
-      const commit = await currentCommit(materializedPath);
+      await cloneRemote(remote, materializedPath, context.config.network.allow_lfs, gitTimeoutMs);
+      const defaultBranch = await detectDefaultBranch(materializedPath, gitTimeoutMs);
+      const commit = await currentCommit(materializedPath, gitTimeoutMs);
       return {
         repoPath: materializedPath,
         selectedRemote: remote,
@@ -268,28 +477,31 @@ async function resolveCloneTarget(
   );
 }
 
-async function checkoutBranchIfDetached(repoPath: string, branch: string): Promise<void> {
+async function checkoutBranchIfDetached(repoPath: string, branch: string, timeoutMs: number): Promise<void> {
   try {
-    const branchName = await currentBranch(repoPath);
+    const branchName = await currentBranch(repoPath, timeoutMs);
     if (branchName === branch) {
       return;
     }
   } catch {
     // Detached HEAD or no branch information.
   }
-  await runGit(['checkout', '--force', branch], { cwd: repoPath });
+  await runGit(['checkout', '--force', branch], { cwd: repoPath, timeoutMs });
 }
 
-async function detectDefaultBranch(repoPath: string): Promise<string> {
+async function detectDefaultBranch(repoPath: string, timeoutMs: number): Promise<string> {
   try {
-    const branch = await currentBranch(repoPath);
+    const branch = await currentBranch(repoPath, timeoutMs);
     if (branch) {
       return branch;
     }
   } catch {
     // Fall through.
   }
-  const result = await runGit(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], { cwd: repoPath });
+  const result = await runGit(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], {
+    cwd: repoPath,
+    timeoutMs,
+  });
   const ref = result.stdout.trim();
   return ref.startsWith('origin/') ? ref.slice('origin/'.length) : 'main';
 }
@@ -322,6 +534,48 @@ export async function addRecord(context: CommandContext, input: string, options:
     commit: options.commit ?? '',
   };
   records.push(record);
+  await saveIndexFile(context.paths.indexPath, records);
+  return record;
+}
+
+export async function findExistingPackageRecord(
+  context: CommandContext,
+  input: string,
+): Promise<PackageRecord | undefined> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const parsed = parseSourceDescriptor(input);
+  return findSamePackageRecord(records, {
+    remote: parsed.remotes[0],
+    subpath: parsed.subpath,
+  });
+}
+
+export async function replaceRecord(
+  context: CommandContext,
+  existingId: string,
+  input: string,
+  options: Partial<PackageRecord>,
+): Promise<PackageRecord> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const index = records.findIndex((record) => record.id === existingId);
+  if (index === -1) {
+    throw new GitMarkError('NOT_FOUND', `Package ${existingId} was not found.`);
+  }
+  const parsed = parseSourceDescriptor(input);
+  const record: PackageRecord = {
+    id: existingId,
+    remotes: options.remotes ?? parsed.remotes,
+    subpath: options.subpath ?? parsed.subpath,
+    summary: options.summary ?? '',
+    description: options.description ?? '',
+    resources: options.resources ?? [],
+    pinned: options.pinned ?? true,
+    kept: options.kept ?? true,
+    discoverable: options.discoverable ?? true,
+    frozen: options.frozen ?? false,
+    commit: options.commit ?? '',
+  };
+  records[index] = record;
   await saveIndexFile(context.paths.indexPath, records);
   return record;
 }
@@ -404,6 +658,7 @@ async function materializeForInspection(
   record: PackageRecord,
 ): Promise<{ repoPath: string; transient: boolean }> {
   await ensureGitAccessible();
+  const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
   const repoKey = repoKeyFor(record);
   const state = await loadState(context.paths.statePath);
   if (record.kept && state.repos[repoKey] && (await pathExists(state.repos[repoKey].path))) {
@@ -417,13 +672,14 @@ async function materializeForInspection(
   const scratchPath = path.join(context.paths.tempRoot, `peek-${sanitizeId(record.id)}-${Date.now()}`);
   const clone = await resolveCloneTarget(context, record, scratchPath, false);
   if (record.frozen && record.commit) {
-    await checkoutCommit(clone.repoPath, record.commit);
+    await checkoutCommit(clone.repoPath, record.commit, gitTimeoutMs);
   }
   return { repoPath: clone.repoPath, transient: true };
 }
 
 export async function loadRecord(context: CommandContext, id: string): Promise<string> {
   await ensureGitAccessible();
+  const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
   const records = await loadIndexFile(context.paths.indexPath);
   const record = records.find((entry) => entry.id === id);
   if (!record) {
@@ -437,16 +693,16 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
     const repoPath = path.join(context.paths.reposRoot, repoKey);
     const clone = await resolveCloneTarget(context, record, repoPath, true);
     if (record.frozen && record.commit) {
-      await checkoutCommit(clone.repoPath, record.commit);
+      await checkoutCommit(clone.repoPath, record.commit, gitTimeoutMs);
     }
     if (!record.frozen && clone.defaultBranch) {
-      await checkoutBranchIfDetached(clone.repoPath, clone.defaultBranch);
+      await checkoutBranchIfDetached(clone.repoPath, clone.defaultBranch, gitTimeoutMs);
     }
     state.repos[repoKey] = {
       path: clone.repoPath,
       selectedRemote: clone.selectedRemote,
       defaultBranch: clone.defaultBranch,
-      lastCommit: await currentCommit(clone.repoPath),
+      lastCommit: await currentCommit(clone.repoPath, gitTimeoutMs),
       updatedAt: new Date().toISOString(),
     };
     await saveState(context.paths.statePath, state);
@@ -459,7 +715,7 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
   if (existingTemp && (await pathExists(existingTemp.path))) {
     existingTemp.lastAccessedAt = new Date().toISOString();
     if (record.frozen && record.commit) {
-      await checkoutCommit(existingTemp.path, record.commit);
+      await checkoutCommit(existingTemp.path, record.commit, gitTimeoutMs);
     }
     await saveState(context.paths.statePath, state);
     await runHooks(context, 'preExpose', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
@@ -470,7 +726,7 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
   const tempPath = path.join(context.paths.tempRoot, `${sanitizeId(record.id)}-${Date.now()}`);
   const clone = await resolveCloneTarget(context, record, tempPath, false);
   if (record.frozen && record.commit) {
-    await checkoutCommit(clone.repoPath, record.commit);
+    await checkoutCommit(clone.repoPath, record.commit, gitTimeoutMs);
   }
   state.temps[record.id] = {
     path: clone.repoPath,
@@ -510,6 +766,7 @@ export async function currentPath(context: CommandContext, id: string): Promise<
 
 export async function updateRecord(context: CommandContext, id: string, force = false): Promise<string> {
   await ensureGitAccessible();
+  const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
   const records = await loadIndexFile(context.paths.indexPath);
   const record = records.find((entry) => entry.id === id);
   if (!record) {
@@ -526,12 +783,12 @@ export async function updateRecord(context: CommandContext, id: string, force = 
   const selectedRemote = repoState?.selectedRemote ?? record.remotes[0];
   const defaultBranch = repoState?.defaultBranch ?? 'main';
   await runHooks(context, 'preUpdate', record, repoPath, selectedRemote, defaultBranch);
-  await fetchRemote(repoPath, 'origin', context.config.network.allow_lfs);
-  await resetToRemoteBranch(repoPath, defaultBranch, 'origin');
+  await fetchRemote(repoPath, 'origin', context.config.network.allow_lfs, gitTimeoutMs);
+  await resetToRemoteBranch(repoPath, defaultBranch, 'origin', gitTimeoutMs);
   if (record.frozen && record.commit) {
-    await checkoutCommit(repoPath, record.commit);
+    await checkoutCommit(repoPath, record.commit, gitTimeoutMs);
   }
-  const commit = await currentCommit(repoPath);
+  const commit = await currentCommit(repoPath, gitTimeoutMs);
   if (record.kept) {
     state.repos[repoKey] = {
       path: repoPath,
@@ -575,6 +832,7 @@ async function currentCloneRoot(context: CommandContext, record: PackageRecord):
 
 export async function freezeRecord(context: CommandContext, id: string): Promise<PackageRecord> {
   await ensureGitAccessible();
+  const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
   const records = await loadIndexFile(context.paths.indexPath);
   const index = records.findIndex((entry) => entry.id === id);
   if (index === -1) {
@@ -582,7 +840,7 @@ export async function freezeRecord(context: CommandContext, id: string): Promise
   }
   const record = records[index];
   const pathOnDisk = await loadRecord(context, id);
-  const commit = await currentCommit(pathOnDisk);
+  const commit = await currentCommit(pathOnDisk, gitTimeoutMs);
   record.frozen = true;
   record.commit = commit;
   records[index] = record;
@@ -628,6 +886,149 @@ export async function unpinRecord(context: CommandContext, id: string): Promise<
   records[index] = record;
   await saveIndexFile(context.paths.indexPath, records);
   return record;
+}
+
+export async function removeRecord(context: CommandContext, id: string): Promise<RemoveRecordResult> {
+  const records = await loadIndexFile(context.paths.indexPath);
+  const recordIndex = records.findIndex((entry) => entry.id === id);
+  if (recordIndex === -1) {
+    throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+
+  const removed = records[recordIndex];
+  const remainingRecords = records.filter((entry) => entry.id !== id);
+  await saveIndexFile(context.paths.indexPath, remainingRecords);
+
+  const result: RemoveRecordResult = {
+    removedId: removed.id,
+    deletedTempStateEntries: 0,
+    deletedRepoStateEntries: 0,
+    deletedTempDirectories: 0,
+    deletedRepoDirectories: 0,
+    reconciliation: {
+      removedTempStateEntries: 0,
+      removedRepoStateEntries: 0,
+      deletedTempDirectories: 0,
+      deletedRepoDirectories: 0,
+      clearedTrackedTempStateEntries: 0,
+    },
+  };
+
+  const state = await loadState(context.paths.statePath);
+  let changed = false;
+
+  const tempState = state.temps[removed.id];
+  if (tempState) {
+    if (await pathExists(tempState.path)) {
+      await removeIfExists(tempState.path);
+      result.deletedTempDirectories += 1;
+    }
+    delete state.temps[removed.id];
+    result.deletedTempStateEntries += 1;
+    changed = true;
+  }
+
+  if (removed.kept) {
+    const repoKey = repoKeyFor(removed);
+    const remainingKeptRepoKeys = new Set(remainingRecords.filter((entry) => entry.kept).map((entry) => repoKeyFor(entry)));
+    const repoState = state.repos[repoKey];
+    if (repoState && !remainingKeptRepoKeys.has(repoKey)) {
+      if (await pathExists(repoState.path)) {
+        await removeIfExists(repoState.path);
+        result.deletedRepoDirectories += 1;
+      }
+      delete state.repos[repoKey];
+      result.deletedRepoStateEntries += 1;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await saveState(context.paths.statePath, state);
+  }
+
+  result.reconciliation = await reconcileRuntimeState(context, {
+    pruneOrphanRepoDirectories: true,
+    pruneOrphanTempDirectories: true,
+  });
+  return result;
+}
+
+export async function syncKeptRecords(context: CommandContext): Promise<SyncRecordsResult> {
+  const reconciliation = await reconcileRuntimeState(context, {
+    pruneOrphanRepoDirectories: true,
+    pruneOrphanTempDirectories: true,
+  });
+  const records = await loadIndexFile(context.paths.indexPath);
+  const keptRecords = records.filter((record) => record.kept);
+  for (const record of keptRecords) {
+    await loadRecord(context, record.id);
+  }
+  return {
+    keptPackagesProcessed: keptRecords.length,
+    reconciliation,
+  };
+}
+
+export async function doctorRuntime(context: CommandContext): Promise<DoctorReport> {
+  const issues: string[] = [];
+
+  try {
+    await ensureGitAccessible();
+  } catch (error) {
+    issues.push(`git unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const snapshot = await collectRuntimeDriftSnapshot(context);
+  const lock = await inspectWriterLock(context);
+
+  if (lock.status === 'stale') {
+    issues.push(`writer lock is stale${lock.ownerSummary}`);
+  }
+
+  for (const tempEntry of snapshot.orphanTempStateEntries) {
+    if (!snapshot.expectedPackageIds.has(tempEntry.id)) {
+      issues.push(`orphan temp state: ${tempEntry.id} -> ${tempEntry.path}`);
+    }
+    if (tempEntry.missingPath) {
+      issues.push(`missing temp materialization: ${tempEntry.id} -> ${tempEntry.path}`);
+    }
+  }
+
+  for (const repoEntry of snapshot.orphanRepoStateEntries) {
+    if (!snapshot.expectedKeptRepoKeys.has(repoEntry.repoKey)) {
+      issues.push(`orphan repo state: ${repoEntry.repoKey} -> ${repoEntry.path}`);
+    }
+    if (repoEntry.missingPath) {
+      issues.push(`missing repo materialization: ${repoEntry.repoKey} -> ${repoEntry.path}`);
+    }
+  }
+
+  for (const missingRepo of snapshot.missingKeptMaterializations) {
+    issues.push(`missing kept materialization: ${missingRepo.id}`);
+  }
+
+  for (const orphanTempDirectory of snapshot.orphanTempDirectories) {
+    issues.push(`orphan temp directory: ${orphanTempDirectory}`);
+  }
+
+  for (const orphanRepoDirectory of snapshot.orphanRepoDirectories) {
+    issues.push(`orphan repo directory: ${path.join(context.paths.reposRoot, orphanRepoDirectory)}`);
+  }
+
+  return {
+    clean: issues.length === 0,
+    issues,
+    lockStatus: lock.status,
+  };
+}
+
+export async function cleanupRuntime(context: CommandContext): Promise<CleanupResult> {
+  return reconcileRuntimeState(context, {
+    pruneOrphanRepoDirectories: true,
+    pruneOrphanTempDirectories: true,
+    clearTrackedTemps: true,
+  });
 }
 
 export async function updateAllRecords(context: CommandContext): Promise<number> {
@@ -704,6 +1105,7 @@ export async function runHooks(
   selectedRemote: string,
   defaultBranch: string,
 ): Promise<void> {
+  const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
   const hookModule = await loadHookModule(context);
   if (!hookModule) {
     return;
@@ -718,7 +1120,7 @@ export async function runHooks(
     visiblePath: record.subpath ? path.join(repoPath, record.subpath) : repoPath,
     selectedRemote,
     subpath: record.subpath ?? '',
-    resolvedCommit: await resolveHookCommit(record, repoPath),
+    resolvedCommit: await resolveHookCommit(record, repoPath, gitTimeoutMs),
     defaultBranch,
     hookName,
   };
@@ -758,10 +1160,10 @@ async function loadHookModule(context: CommandContext): Promise<Partial<Record<H
   }
 }
 
-async function resolveHookCommit(record: PackageRecord, repoPath: string): Promise<string> {
+async function resolveHookCommit(record: PackageRecord, repoPath: string, timeoutMs: number): Promise<string> {
   if (await pathExists(repoPath)) {
     try {
-      return await currentCommit(repoPath);
+      return await currentCommit(repoPath, timeoutMs);
     } catch {
       // Fall back to the record commit when the repo is not fully ready yet.
     }

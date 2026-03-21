@@ -16,10 +16,12 @@ test('suggestSummary prefers a README heading', () => {
   assert.equal(summary, 'Sample Skills');
 });
 
-test('collectAddDraft keeps blank summary blank when the user presses enter', async () => {
-  const answers: Array<string | boolean> = ['', 'empty', '', true, true, false];
+test('collectAddDraft uses the suggested summary as the default value', async () => {
+  const answers: Array<string | boolean> = ['Suggested summary', 'empty', '', true, true, false];
+  const seenInitialValues: string[] = [];
   const prompt = {
-    async input(): Promise<string> {
+    async input(_message: string, initial?: string): Promise<string> {
+      seenInitialValues.push(initial ?? '');
       return String(answers.shift() ?? '');
     },
     async select<T>(): Promise<T> {
@@ -33,7 +35,38 @@ test('collectAddDraft keeps blank summary blank when the user presses enter', as
       preview: [],
       readmeExcerpt: 'README content',
     },
-    {},
+    { summary: 'Suggested summary' },
+    prompt,
+  );
+  assert.equal(draft.summary, 'Suggested summary');
+  assert.equal(seenInitialValues[0], 'Suggested summary');
+  assert.equal(draft.description, '');
+  assert.equal(draft.pinned, true);
+  assert.equal(draft.kept, true);
+  assert.equal(draft.discoverable, false);
+});
+
+test('collectAddDraft keeps an explicitly cleared summary empty', async () => {
+  const answers: Array<string | boolean> = ['', 'empty', '', true, true, false];
+  const prompt = {
+    async input(message: string, initial?: string): Promise<string> {
+      if (message.startsWith('Summary')) {
+        assert.equal(initial, 'Suggested summary');
+      }
+      return String(answers.shift() ?? '');
+    },
+    async select<T>(): Promise<T> {
+      return answers.shift() as T;
+    },
+  };
+  const draft = await collectAddDraft(
+    {
+      source: 'https://example.com/repo',
+      remote: 'https://example.com/repo',
+      preview: [],
+      readmeExcerpt: 'README content',
+    },
+    { summary: 'Suggested summary' },
     prompt,
   );
   assert.equal(draft.summary, '');
