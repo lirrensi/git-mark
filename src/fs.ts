@@ -30,3 +30,13 @@ export async function writeText(targetPath: string, content: string): Promise<vo
   await fs.writeFile(targetPath, content, 'utf8');
 }
 
+export async function writeTextAtomic(targetPath: string, content: string): Promise<void> {
+  const directory = path.dirname(targetPath);
+  const tempPath = path.join(
+    directory,
+    `.${path.basename(targetPath)}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  );
+  await ensureDir(directory);
+  await fs.writeFile(tempPath, content, 'utf8');
+  await fs.rename(tempPath, targetPath);
+}

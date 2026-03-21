@@ -24,11 +24,20 @@ export interface NetworkConfig {
 }
 
 export interface HooksConfig {
-  pre_load: string;
-  pre_expose: string;
-  post_load: string;
-  pre_update: string;
-  post_update: string;
+  module: string;
+}
+
+export type HookName = 'preLoad' | 'preExpose' | 'postLoad' | 'preUpdate' | 'postUpdate';
+
+export interface HookContext {
+  packageId: string;
+  repoPath: string;
+  visiblePath: string;
+  selectedRemote: string;
+  subpath: string;
+  resolvedCommit: string;
+  defaultBranch: string;
+  hookName: HookName;
 }
 
 export interface RuntimeConfig {
@@ -59,10 +68,13 @@ export interface ToolState {
   temps: Record<string, TempState>;
 }
 
-export interface ToolPaths {
+export interface BootstrapPaths {
   home: string;
   indexPath: string;
   configPath: string;
+}
+
+export interface ToolPaths extends BootstrapPaths {
   logPath: string;
   statePath: string;
   storageRoot: string;

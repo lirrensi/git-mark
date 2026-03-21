@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { ensureDir } from './fs.ts';
-import type { ToolPaths } from './types.ts';
+import type { BootstrapPaths, RuntimeConfig, ToolPaths } from './types.ts';
 
 export function getHomeDir(): string {
   return os.homedir();
@@ -17,18 +17,25 @@ export function expandHome(input: string): string {
   return input;
 }
 
-export function getToolPaths(): ToolPaths {
+export function getBootstrapPaths(): BootstrapPaths {
   const home = getHomeDir();
-  const storageRoot = expandHome('~/.gitmark');
   return {
     home,
     indexPath: expandHome('~/.gitmarks.toml'),
-    configPath: path.join(storageRoot, 'config.toml'),
+    configPath: path.join(expandHome('~/.gitmark'), 'config.toml'),
+  };
+}
+
+export function resolveToolPaths(bootstrapPaths: BootstrapPaths, config: RuntimeConfig): ToolPaths {
+  const storageRoot = expandHome(config.storage.root);
+  const tempRoot = expandHome(config.storage.temp_root);
+  return {
+    ...bootstrapPaths,
     logPath: path.join(storageRoot, 'history.log'),
     statePath: path.join(storageRoot, 'state.json'),
     storageRoot,
     reposRoot: path.join(storageRoot, 'repos'),
-    tempRoot: path.join(storageRoot, 'tmp'),
+    tempRoot,
   };
 }
 

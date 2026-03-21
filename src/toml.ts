@@ -1,5 +1,9 @@
 import type { PackageRecord, RuntimeConfig } from './types.ts';
 
+function formatTomlError(target: 'index' | 'config', lineNumber: number, message: string): Error {
+  return new Error(`Invalid ${target} TOML at line ${lineNumber}: ${message}`);
+}
+
 function stripComment(line: string): string {
   let inDouble = false;
   let inSingle = false;
@@ -138,23 +142,29 @@ function boolOrDefault(value: unknown, fallback: boolean): boolean {
 export function parsePackageIndex(text: string): PackageRecord[] {
   const records: PackageRecord[] = [];
   let current: Partial<PackageRecord> | null = null;
+  let sawContent = false;
 
-  for (const rawLine of text.split('\n')) {
+  for (const [lineIndex, rawLine] of text.split('\n').entries()) {
+    const lineNumber = lineIndex + 1;
     const line = stripComment(rawLine).trim();
     if (line.length === 0) {
       continue;
     }
+    sawContent = true;
     if (line === '[[package]]') {
+      if (current) {
+        validatePackageRecord(current, records.length, lineNumber - 1);
+      }
       current = {};
       records.push(current as PackageRecord);
       continue;
     }
     if (!current) {
-      continue;
+      throw formatTomlError('index', lineNumber, 'package fields must appear after [[package]].');
     }
     const separatorIndex = line.indexOf('=');
     if (separatorIndex === -1) {
-      continue;
+      throw formatTomlError('index', lineNumber, `expected key = value, got ${JSON.stringify(line)}.`);
     }
     const key = line.slice(0, separatorIndex).trim();
     const value = parseTomlValue(line.slice(separatorIndex + 1));
@@ -168,24 +178,40 @@ export function parsePackageIndex(text: string): PackageRecord[] {
     }
     if (key === 'id' || key === 'subpath' || key === 'summary' || key === 'description' || key === 'commit') {
       current[key] = String(value);
+      continue;
     }
+    throw formatTomlError('index', lineNumber, `unknown package key ${JSON.stringify(key)}.`);
   }
 
-  return records
-    .filter((record) => typeof record.id === 'string' && Array.isArray(record.remotes) && record.remotes.length > 0)
-    .map((record) => ({
-      id: record.id ?? '',
-      remotes: record.remotes ?? [],
-      subpath: record.subpath,
-      summary: record.summary,
-      description: record.description,
-      resources: record.resources,
-      pinned: boolOrDefault(record.pinned, false),
-      kept: boolOrDefault(record.kept, false),
-      discoverable: boolOrDefault(record.discoverable, true),
-      frozen: boolOrDefault(record.frozen, false),
-      commit: record.commit,
-    }));
+  if (current) {
+    validatePackageRecord(current, records.length, text.split('\n').length);
+  }
+  if (!sawContent) {
+    return [];
+  }
+
+  return records.map((record) => ({
+    id: record.id ?? '',
+    remotes: record.remotes ?? [],
+    subpath: record.subpath,
+    summary: record.summary,
+    description: record.description,
+    resources: record.resources,
+    pinned: boolOrDefault(record.pinned, false),
+    kept: boolOrDefault(record.kept, false),
+    discoverable: boolOrDefault(record.discoverable, true),
+    frozen: boolOrDefault(record.frozen, false),
+    commit: record.commit,
+  }));
+}
+
+function validatePackageRecord(record: Partial<PackageRecord>, index: number, lineNumber: number): void {
+  if (typeof record.id !== 'string' || record.id.length === 0) {
+    throw formatTomlError('index', lineNumber, `package #${index} is missing a valid id.`);
+  }
+  if (!Array.isArray(record.remotes) || record.remotes.length === 0) {
+    throw formatTomlError('index', lineNumber, `package ${JSON.stringify(record.id)} is missing remotes.`);
+  }
 }
 
 export function stringifyPackageIndex(records: PackageRecord[]): string {
@@ -221,12 +247,15 @@ export function stringifyPackageIndex(records: PackageRecord[]): string {
 export function parseRuntimeConfig(text: string): Partial<RuntimeConfig> {
   const config: Partial<RuntimeConfig> = {};
   let section: 'storage' | 'network' | 'hooks' | null = null;
+  let sawContent = false;
 
-  for (const rawLine of text.split('\n')) {
+  for (const [lineIndex, rawLine] of text.split('\n').entries()) {
+    const lineNumber = lineIndex + 1;
     const line = stripComment(rawLine).trim();
     if (line.length === 0) {
       continue;
     }
+    sawContent = true;
     if (line === '[storage]' || line === '[network]' || line === '[hooks]') {
       section = line.slice(1, -1) as 'storage' | 'network' | 'hooks';
       if (section === 'storage' && !config.storage) {
@@ -241,11 +270,11 @@ export function parseRuntimeConfig(text: string): Partial<RuntimeConfig> {
       continue;
     }
     if (!section) {
-      continue;
+      throw formatTomlError('config', lineNumber, 'keys must appear inside [storage], [network], or [hooks].');
     }
     const separatorIndex = line.indexOf('=');
     if (separatorIndex === -1) {
-      continue;
+      throw formatTomlError('config', lineNumber, `expected key = value, got ${JSON.stringify(line)}.`);
     }
     const key = line.slice(0, separatorIndex).trim();
     const value = parseTomlValue(line.slice(separatorIndex + 1));
@@ -258,6 +287,10 @@ export function parseRuntimeConfig(text: string): Partial<RuntimeConfig> {
     if (section === 'hooks' && config.hooks) {
       (config.hooks as unknown as Record<string, unknown>)[key] = value;
     }
+  }
+
+  if (!sawContent) {
+    return config;
   }
 
   return config;
@@ -275,11 +308,7 @@ export function stringifyRuntimeConfig(config: RuntimeConfig): string {
     `allow_lfs = ${config.network.allow_lfs ? 'true' : 'false'}`,
     '',
     '[hooks]',
-    `pre_load = ${JSON.stringify(config.hooks.pre_load)}`,
-    `pre_expose = ${JSON.stringify(config.hooks.pre_expose)}`,
-    `post_load = ${JSON.stringify(config.hooks.post_load)}`,
-    `pre_update = ${JSON.stringify(config.hooks.pre_update)}`,
-    `post_update = ${JSON.stringify(config.hooks.post_update)}`,
+    `module = ${JSON.stringify(config.hooks.module)}`,
     '',
   ].join('\n');
 }

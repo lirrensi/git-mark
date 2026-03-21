@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   cloneRemote,
   currentBranch,
@@ -12,10 +12,13 @@ import {
   resetToRemoteBranch,
   runGit,
 } from './git.ts';
+import { expandHome } from './env.ts';
 import { GitMarkError } from './errors.ts';
-import { ensureDir, pathExists, readTextIfExists, removeIfExists, writeText } from './fs.ts';
+import { ensureDir, pathExists, readTextIfExists, removeIfExists, writeTextAtomic } from './fs.ts';
 import type {
   CommandContext,
+  HookContext,
+  HookName,
   PackageRecord,
   RepoState,
   SearchHit,
@@ -23,11 +26,13 @@ import type {
   ToolState,
 } from './types.ts';
 import { parsePackageIndex, stringifyPackageIndex } from './toml.ts';
-import { searchPackages } from './search.ts';
+import { countSearchPackages, searchPackages } from './search.ts';
 import type { AddInspection } from './types.ts';
 
 const DEFAULT_MAX_LINES = 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_PREVIEW_LIMIT = 12;
+const DEFAULT_README_EXCERPT_LENGTH = 400;
 
 export function defaultRuntimeConfig() {
   return {
@@ -41,11 +46,7 @@ export function defaultRuntimeConfig() {
       allow_lfs: false,
     },
     hooks: {
-      pre_load: '',
-      pre_expose: '',
-      post_load: '',
-      pre_update: '',
-      post_update: '',
+      module: '',
     },
   };
 }
@@ -113,7 +114,7 @@ export async function loadIndexFile(indexPath: string): Promise<PackageRecord[]>
 }
 
 export async function saveIndexFile(indexPath: string, records: PackageRecord[]): Promise<void> {
-  await writeText(indexPath, stringifyPackageIndex(records));
+  await writeTextAtomic(indexPath, stringifyPackageIndex(records));
 }
 
 export async function loadState(statePath: string): Promise<ToolState> {
@@ -121,15 +122,20 @@ export async function loadState(statePath: string): Promise<ToolState> {
   if (!text) {
     return { repos: {}, temps: {} };
   }
-  const parsed = JSON.parse(text) as Partial<ToolState>;
-  return {
-    repos: parsed.repos ?? {},
-    temps: parsed.temps ?? {},
-  };
+  try {
+    const parsed = JSON.parse(text) as Partial<ToolState>;
+    return {
+      repos: parsed.repos ?? {},
+      temps: parsed.temps ?? {},
+    };
+  } catch {
+    await preserveBrokenStateFile(statePath);
+    return { repos: {}, temps: {} };
+  }
 }
 
 export async function saveState(statePath: string, state: ToolState): Promise<void> {
-  await writeText(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  await writeTextAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 export async function cleanupTempMaterializations(context: CommandContext): Promise<void> {
@@ -188,6 +194,14 @@ async function calculateDirectorySize(targetPath: string): Promise<number> {
     }
   }
   return total;
+}
+
+async function preserveBrokenStateFile(statePath: string): Promise<void> {
+  const brokenPath = path.join(
+    path.dirname(statePath),
+    `state.broken-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+  );
+  await fs.rename(statePath, brokenPath);
 }
 
 async function ensureRepoRoot(context: CommandContext): Promise<void> {
@@ -318,9 +332,17 @@ export async function listRecords(context: CommandContext, all = false): Promise
   return filtered.slice().sort((left, right) => left.id.localeCompare(right.id));
 }
 
-export async function searchRecords(context: CommandContext, query: string): Promise<SearchHit[]> {
+export async function searchRecords(
+  context: CommandContext,
+  query: string,
+  limit = 10,
+  offset = 0,
+): Promise<{ hits: SearchHit[]; total: number }> {
   const records = await loadIndexFile(context.paths.indexPath);
-  return searchPackages(records, query);
+  return {
+    hits: searchPackages(records, query, limit, offset),
+    total: countSearchPackages(records, query),
+  };
 }
 
 export async function peekRecord(
@@ -408,7 +430,7 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
     throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
   }
   const plannedPath = plannedMaterializationPath(context, record);
-  await runHooks(context, 'pre_load', record, plannedPath, record.remotes[0], '');
+  await runHooks(context, 'preLoad', record, plannedPath, record.remotes[0], '');
   const state = await loadState(context.paths.statePath);
   if (record.kept) {
     const repoKey = repoKeyFor(record);
@@ -428,8 +450,8 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
       updatedAt: new Date().toISOString(),
     };
     await saveState(context.paths.statePath, state);
-    await runHooks(context, 'pre_expose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
-    await runHooks(context, 'post_load', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+    await runHooks(context, 'preExpose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+    await runHooks(context, 'postLoad', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
     return resolveVisiblePath(record, clone.repoPath);
   }
 
@@ -440,8 +462,8 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
       await checkoutCommit(existingTemp.path, record.commit);
     }
     await saveState(context.paths.statePath, state);
-    await runHooks(context, 'pre_expose', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
-    await runHooks(context, 'post_load', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
+    await runHooks(context, 'preExpose', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
+    await runHooks(context, 'postLoad', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
     return resolveVisiblePath(record, existingTemp.path);
   }
 
@@ -459,8 +481,8 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
     lastAccessedAt: new Date().toISOString(),
   };
   await saveState(context.paths.statePath, state);
-  await runHooks(context, 'pre_expose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
-  await runHooks(context, 'post_load', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+  await runHooks(context, 'preExpose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
+  await runHooks(context, 'postLoad', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
   return resolveVisiblePath(record, clone.repoPath);
 }
 
@@ -503,7 +525,7 @@ export async function updateRecord(context: CommandContext, id: string, force = 
   const repoState = record.kept ? state.repos[repoKey] : state.temps[record.id];
   const selectedRemote = repoState?.selectedRemote ?? record.remotes[0];
   const defaultBranch = repoState?.defaultBranch ?? 'main';
-  await runHooks(context, 'pre_update', record, repoPath, selectedRemote, defaultBranch);
+  await runHooks(context, 'preUpdate', record, repoPath, selectedRemote, defaultBranch);
   await fetchRemote(repoPath, 'origin', context.config.network.allow_lfs);
   await resetToRemoteBranch(repoPath, defaultBranch, 'origin');
   if (record.frozen && record.commit) {
@@ -530,7 +552,7 @@ export async function updateRecord(context: CommandContext, id: string, force = 
     };
   }
   await saveState(context.paths.statePath, state);
-  await runHooks(context, 'post_update', record, repoPath, selectedRemote, defaultBranch);
+  await runHooks(context, 'postUpdate', record, repoPath, selectedRemote, defaultBranch);
   return resolveVisiblePath(record, repoPath);
 }
 
@@ -626,7 +648,7 @@ export async function previewVisiblePath(repoPath: string, subpath?: string): Pr
   if (!(await pathExists(base))) {
     return [];
   }
-  const entries = await listDirectoryPreview(base, 2, 24);
+  const entries = await listDirectoryPreview(base, 2, DEFAULT_PREVIEW_LIMIT);
   return entries;
 }
 
@@ -668,7 +690,7 @@ async function readReadmeExcerpt(record: PackageRecord, repoPath: string): Promi
       continue;
     }
     const text = await fs.readFile(candidate, 'utf8');
-    const excerpt = text.slice(0, 1000).replace(/\s+/g, ' ').trim();
+    const excerpt = text.slice(0, DEFAULT_README_EXCERPT_LENGTH).replace(/\s+/g, ' ').trim();
     return excerpt.length > 0 ? excerpt : undefined;
   }
   return undefined;
@@ -676,51 +698,75 @@ async function readReadmeExcerpt(record: PackageRecord, repoPath: string): Promi
 
 export async function runHooks(
   context: CommandContext,
-  hookName: keyof CommandContext['config']['hooks'],
+  hookName: HookName,
   record: PackageRecord,
   repoPath: string,
   selectedRemote: string,
   defaultBranch: string,
 ): Promise<void> {
-  const command = context.config.hooks[hookName];
-  if (!command) {
+  const hookModule = await loadHookModule(context);
+  if (!hookModule) {
     return;
   }
-  const env = {
-    ...process.env,
-    GMK_ID: record.id,
-    GMK_REPO_PATH: repoPath,
-    GMK_REMOTE: selectedRemote,
-    GMK_SUBPATH: record.subpath ?? '',
-    GMK_COMMIT: record.commit ?? '',
-    GMK_BRANCH: defaultBranch,
+  const hook = hookModule[hookName];
+  if (typeof hook !== 'function') {
+    return;
+  }
+  const hookContext: HookContext = {
+    packageId: record.id,
+    repoPath,
+    visiblePath: record.subpath ? path.join(repoPath, record.subpath) : repoPath,
+    selectedRemote,
+    subpath: record.subpath ?? '',
+    resolvedCommit: await resolveHookCommit(record, repoPath),
+    defaultBranch,
+    hookName,
   };
-  const cwd = hookName === 'pre_load' ? path.dirname(repoPath) : repoPath;
-  await runShellCommand(command, cwd, env);
+  try {
+    await hook(hookContext);
+  } catch (error) {
+    throw new GitMarkError(
+      'HOOK_FAILED',
+      `${hookName} hook failed for package ${record.id}: ${error instanceof Error ? error.message : String(error)}`,
+      1,
+      error,
+    );
+  }
 }
 
-async function runShellCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('sh', ['-lc', command], {
-      cwd,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-    child.on('error', (error) => {
-      reject(new GitMarkError('HOOK_FAILED', `Hook could not start: ${error.message}`));
-    });
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new GitMarkError('HOOK_FAILED', `Hook failed with exit code ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
-    });
-  });
+async function loadHookModule(context: CommandContext): Promise<Partial<Record<HookName, (context: HookContext) => unknown>> | null> {
+  const configuredPath = context.config.hooks.module.trim();
+  if (!configuredPath) {
+    return null;
+  }
+  const expandedPath = expandHome(configuredPath);
+  const resolvedPath = path.isAbsolute(expandedPath)
+    ? expandedPath
+    : path.resolve(path.dirname(context.paths.configPath), expandedPath);
+  if (!(await pathExists(resolvedPath))) {
+    throw new GitMarkError('HOOK_LOAD_FAILED', `Hook module could not be loaded from ${resolvedPath}: file does not exist.`);
+  }
+  try {
+    return (await import(pathToFileURL(resolvedPath).href)) as Partial<Record<HookName, (context: HookContext) => unknown>>;
+  } catch (error) {
+    throw new GitMarkError(
+      'HOOK_LOAD_FAILED',
+      `Hook module could not be loaded from ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`,
+      1,
+      error,
+    );
+  }
+}
+
+async function resolveHookCommit(record: PackageRecord, repoPath: string): Promise<string> {
+  if (await pathExists(repoPath)) {
+    try {
+      return await currentCommit(repoPath);
+    } catch {
+      // Fall back to the record commit when the repo is not fully ready yet.
+    }
+  }
+  return record.commit ?? '';
 }
 
 function plannedMaterializationPath(context: CommandContext, record: PackageRecord): string {

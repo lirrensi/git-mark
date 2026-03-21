@@ -25,6 +25,9 @@ test('help text includes the CLI commands and help alias', () => {
   assert.match(help, /gmk pin/);
   assert.match(help, /gmk unpin/);
   assert.match(help, /--yes/);
+  assert.match(help, /list-all \[--limit <n>\] \[--offset <n>\]/);
+  assert.match(help, /search <query> \[--limit <n>\] \[--offset <n>\]/);
+  assert.match(help, /defaults to `--limit 15 --offset 0`/);
   assert.match(help, /arrow-key choices/);
 });
 

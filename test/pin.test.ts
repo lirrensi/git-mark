@@ -28,11 +28,7 @@ function makeContext(root: string) {
         allow_lfs: false,
       },
       hooks: {
-        pre_load: '',
-        pre_expose: '',
-        post_load: '',
-        pre_update: '',
-        post_update: '',
+        module: '',
       },
     },
   };
@@ -63,4 +59,3 @@ test('pinRecord and unpinRecord toggle the surfaced flag only', async () => {
   assert.equal(records[0].pinned, false);
   assert.equal(records[0].kept, true);
 });
-

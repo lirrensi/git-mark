@@ -1,7 +1,7 @@
 #!/usr/bin/env -S node --experimental-strip-types
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { ensureToolDirectories, getToolPaths } from './env.ts';
+import { ensureToolDirectories, getBootstrapPaths, resolveToolPaths } from './env.ts';
 import { formatRedError, GitMarkError } from './errors.ts';
 import { ImplementationLogger } from './log.ts';
 import { ensureConfigFile, loadRuntimeConfig } from './config.ts';
@@ -95,6 +95,20 @@ function toStringArray(value: string | boolean | string[] | undefined): string[]
   return [];
 }
 
+function parseIntegerOption(
+  value: string | boolean | string[] | undefined,
+  fallback: number,
+  minimum = 0,
+): number {
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    const parsed = Number(value);
+    if (parsed >= minimum) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
 function printRecords(records: PackageRecord[], includeDetails: boolean): void {
   if (records.length === 0) {
     console.log('No packages found.');
@@ -131,6 +145,14 @@ function printSearchResults(results: Array<{ record: PackageRecord; score: numbe
   }
 }
 
+function printContinuationHint(command: string, offset: number, limit: number, total: number): void {
+  const nextOffset = offset + limit;
+  if (nextOffset >= total) {
+    return;
+  }
+  console.log(`More results available. Use \`${command} --offset ${nextOffset} --limit ${limit}\` to continue.`);
+}
+
 function printPeek(record: PackageRecord, preview: string[], readme?: string): void {
   console.log(record.id);
   console.log(`  remotes: ${record.remotes.join(', ')}`);
@@ -163,8 +185,7 @@ function printPeek(record: PackageRecord, preview: string[], readme?: string): v
 }
 
 export async function runCli(rawArgs: string[]): Promise<void> {
-  const paths = getToolPaths();
-  const logger = new ImplementationLogger(paths.logPath);
+  const bootstrapPaths = getBootstrapPaths();
 
   const command = rawArgs[0];
   if (!command || command === '--help' || command === '-h' || command === '-help' || command === 'help') {
@@ -176,12 +197,16 @@ export async function runCli(rawArgs: string[]): Promise<void> {
     return;
   }
 
-  await ensureToolDirectories(paths);
-  await ensureConfigFile(paths.configPath);
-  const config = await loadRuntimeConfig(paths.configPath);
-  const context: CommandContext = { paths, config };
+  let logger: ImplementationLogger | null = null;
 
   try {
+    await ensureConfigFile(bootstrapPaths.configPath);
+    const config = await loadRuntimeConfig(bootstrapPaths.configPath);
+    const paths = resolveToolPaths(bootstrapPaths, config);
+    await ensureToolDirectories(paths);
+    logger = new ImplementationLogger(paths.logPath);
+    const context: CommandContext = { paths, config };
+
     await cleanupTempMaterializations(context);
 
     switch (command) {
@@ -242,16 +267,25 @@ export async function runCli(rawArgs: string[]): Promise<void> {
         return;
       }
       case 'list-all': {
+        const { values } = parseOptions(rawArgs.slice(1));
+        const limit = parseIntegerOption(values.limit, 15, 1);
+        const offset = parseIntegerOption(values.offset, 0, 0);
         const records = await listRecords(context, true);
-        printRecords(records, true);
-        await logger.info('list-all', { count: records.length });
+        const page = records.slice(offset, offset + limit);
+        printRecords(page, true);
+        printContinuationHint('gmk list-all', offset, limit, records.length);
+        await logger.info('list-all', { count: page.length, total: records.length, limit, offset });
         return;
       }
       case 'search': {
-        const query = rawArgs.slice(1).join(' ').trim();
-        const results = await searchRecords(context, query);
-        printSearchResults(results);
-        await logger.info('search', { query, count: results.length });
+        const { values, remaining } = parseOptions(rawArgs.slice(1));
+        const query = remaining.join(' ').trim();
+        const limit = parseIntegerOption(values.limit, 10, 1);
+        const offset = parseIntegerOption(values.offset, 0, 0);
+        const results = await searchRecords(context, query, limit, offset);
+        printSearchResults(results.hits);
+        printContinuationHint(`gmk search ${query}`, offset, limit, results.total);
+        await logger.info('search', { query, count: results.hits.length, total: results.total, limit, offset });
         return;
       }
       case 'peek': {
@@ -344,10 +378,12 @@ export async function runCli(rawArgs: string[]): Promise<void> {
         throw new GitMarkError('USAGE', `Unknown command: ${command}`);
     }
   } catch (error) {
-    await logger.error('command failed', {
-      command,
-      message: error instanceof Error ? error.message : String(error),
-    });
+    if (logger) {
+      await logger.error('command failed', {
+        command,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     console.error(formatRedError(error));
     if (error instanceof GitMarkError && error.status > 1) {
       process.exitCode = error.status;

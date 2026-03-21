@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { loadRuntimeConfig } from '../src/config.ts';
+import { loadIndexFile } from '../src/index.ts';
 import { parsePackageIndex, stringifyPackageIndex, parseRuntimeConfig, stringifyRuntimeConfig } from '../src/toml.ts';
 
 test('package index round trip', () => {
@@ -37,14 +42,37 @@ test('runtime config round trip', () => {
       allow_lfs: false,
     },
     hooks: {
-      pre_load: '',
-      pre_expose: '',
-      post_load: '',
-      pre_update: '',
-      post_update: '',
+      module: '~/hooks/gitmark-hooks.ts',
     },
   });
   const parsed = parseRuntimeConfig(config);
   assert.equal(parsed.storage?.root, '/tmp/gitmark');
+  assert.equal(parsed.hooks?.module, '~/hooks/gitmark-hooks.ts');
 });
 
+test('runtime config parses hooks.module from TOML', () => {
+  const parsed = parseRuntimeConfig('[hooks]\nmodule = "./hooks.ts"\n');
+  assert.equal(parsed.hooks?.module, './hooks.ts');
+});
+
+test('malformed config.toml fails loudly after the file exists', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gmk-config-invalid-'));
+  const configPath = path.join(root, 'config.toml');
+  await fs.writeFile(configPath, 'root = "/tmp/outside-section"\n', 'utf8');
+
+  await assert.rejects(
+    () => loadRuntimeConfig(configPath),
+    /Could not load config file .*config\.toml: Invalid config TOML at line 1: keys must appear inside/,
+  );
+});
+
+test('malformed package index fails loudly with line context', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gmk-index-invalid-'));
+  const indexPath = path.join(root, '.gitmarks.toml');
+  await fs.writeFile(indexPath, '[[package]]\nid = "design"\n', 'utf8');
+
+  await assert.rejects(
+    () => loadIndexFile(indexPath),
+    /Invalid index TOML at line \d+: package "design" is missing remotes\./,
+  );
+});

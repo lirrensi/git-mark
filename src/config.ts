@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { defaultRuntimeConfig } from './index.ts';
-import { ensureDir } from './fs.ts';
+import { GitMarkError } from './errors.ts';
+import { ensureDir, writeTextAtomic } from './fs.ts';
 import { parseRuntimeConfig, stringifyRuntimeConfig } from './toml.ts';
 import type { RuntimeConfig } from './types.ts';
 
@@ -32,21 +33,19 @@ export async function loadRuntimeConfig(configPath: string): Promise<RuntimeConf
       hooks: {
         ...defaults.hooks,
         ...(parsed.hooks ?? {}),
-        pre_load: String((parsed.hooks as Record<string, unknown> | undefined)?.pre_load ?? defaults.hooks.pre_load),
-        pre_expose: String(
-          (parsed.hooks as Record<string, unknown> | undefined)?.pre_expose ?? defaults.hooks.pre_expose,
-        ),
-        post_load: String((parsed.hooks as Record<string, unknown> | undefined)?.post_load ?? defaults.hooks.post_load),
-        pre_update: String(
-          (parsed.hooks as Record<string, unknown> | undefined)?.pre_update ?? defaults.hooks.pre_update,
-        ),
-        post_update: String(
-          (parsed.hooks as Record<string, unknown> | undefined)?.post_update ?? defaults.hooks.post_update,
-        ),
+        module: String((parsed.hooks as Record<string, unknown> | undefined)?.module ?? defaults.hooks.module),
       },
     };
-  } catch {
-    return defaultRuntimeConfig();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+      return defaultRuntimeConfig();
+    }
+    throw new GitMarkError(
+      'CONFIG_INVALID',
+      `Could not load config file ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+      1,
+      error,
+    );
   }
 }
 
@@ -56,7 +55,6 @@ export async function ensureConfigFile(configPath: string): Promise<void> {
   try {
     await fs.access(configPath);
   } catch {
-    await fs.writeFile(configPath, stringifyRuntimeConfig(defaults), 'utf8');
+    await writeTextAtomic(configPath, stringifyRuntimeConfig(defaults));
   }
 }
-

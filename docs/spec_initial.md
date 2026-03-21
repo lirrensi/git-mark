@@ -26,14 +26,14 @@
 
 Each package record has two independent flags:
 
-### Flag 1: `pinned` - surfaced by default
+### Flag 1: `pinned` - surfaced favorites by default
 
 | Value | Meaning |
 |-------|---------|
-| `true` | Included in `gmk list` |
+| `true` | Included in `gmk list` and surfaced as a favorite for agent-facing default context |
 | `false` | Hidden from default list output, but still searchable and loadable |
 
-`pinned` does **not** promise agent integration. It only controls what the tool surfaces by default.
+`pinned` marks favorites that the tool surfaces by default. It does **not** promise a richer integration layer beyond default CLI and MCP surfacing.
 
 `pinned` and `kept` are fully independent. A package may be pinned but temp-only (`pinned = true`, `kept = false`). In that case it is surfaced by default, but it is still materialized only on demand.
 
@@ -122,11 +122,7 @@ git_timeout_sec = 120
 allow_lfs = false
 
 [hooks]
-pre_load = ""
-pre_expose = ""
-post_load = ""
-pre_update = ""
-post_update = ""
+module = ""
 ```
 
 ### What belongs in config
@@ -154,29 +150,32 @@ Git LFS should be explicitly controllable.
 
 ### Hooks
 
-Hooks are local machine commands configured by the user.
+Hooks are configured as a local TypeScript module file path.
 
 They are not package metadata, and they are not fetched from the package source.
 
 The core hook points should include:
 
-- `pre_load`
-- `pre_expose`
-- `post_load`
-- `pre_update`
-- `post_update`
+- `preLoad`
+- `preExpose`
+- `postLoad`
+- `preUpdate`
+- `postUpdate`
+
+`hooks.module` points to a TypeScript file that the tool loads directly. The module may export any subset of those hook functions by name.
 
 ### Hook semantics
 
-- `pre_load` runs before a load operation starts
-- `pre_expose` runs after clone or fetch work is complete, but before a path is returned to the caller
-- `post_load` runs after a successful load
-- `pre_update` and `post_update` wrap update operations
-- hooks receive relevant context such as package id, local repo path, returned subpath, selected remote, and resolved commit
+- `preLoad` runs before a load operation starts
+- `preExpose` runs after clone or fetch work is complete, but before a path is returned to the caller
+- `postLoad` runs after a successful load
+- `preUpdate` and `postUpdate` wrap update operations
+- each hook receives one plain context object containing package id, repo path, visible path, selected remote, subpath, resolved commit, default branch, and hook name
 
 ### Hook failure behavior
 
-- if a blocking hook such as `pre_expose` exits non-zero, the command should fail and no path should be returned
+- if the configured module cannot be loaded, the command should fail clearly
+- if a blocking hook such as `preExpose` throws, the command should fail and no path should be returned
 - this is the intended place for security scanning, policy checks, or other local validation
 - post hooks may also fail loudly, but should not retroactively pretend the underlying operation never happened unless the implementation explicitly supports rollback
 
@@ -264,6 +263,15 @@ Temp cleanup is synchronous and tool-managed.
 - after cleanup, the requested command runs normally
 - `gmk load <id>` is the repair operation that re-materializes a temp package if cleanup just removed it
 
+### Tool-owned runtime state
+
+`state.json` is disposable tool-owned state under the runtime storage root.
+
+- it tracks materialized repo and temp paths
+- writes should use atomic replacement where practical
+- if `state.json` becomes malformed, the tool may preserve it as `state.broken-*.json` and continue with an empty in-memory state
+- malformed `~/.gitmarks.toml` or `config.toml` should still fail loudly because they remain user-managed truth
+
 ---
 
 ## Discovery Model
@@ -274,17 +282,17 @@ The tool supports three levels of discovery:
 2. **Full bookmark set** via `gmk list-all`
 3. **Full-text lookup** via `gmk search`
 
-### Output budget
+### Default command shape
 
-Discovery output should be intentionally small.
-
-- Default command output should not exceed about `2 KB`.
-- If the result set is larger, the tool should require paging, cursors, or an explicit follow-up.
-- The goal is to avoid flooding agent context or terminal output when indexes get large.
+- `gmk list` prints all pinned favorites.
+- `gmk list-all` is the broader bookmark listing and defaults to `--limit 15 --offset 0`.
+- `gmk search <query>` searches the broader discoverable set and defaults to `--limit 10 --offset 0`.
+- bounded commands should offer a continuation hint when more results exist.
 
 ### Search behavior
 
 - `gmk search <query>` searches across all discoverable packages.
+- by default it returns the first `10` matches, with paging available through limit and offset flags
 - Search should use `summary`, `description`, and `resources`.
 - Packages with `discoverable = false` are omitted from search results but remain directly addressable by `id`.
 
@@ -346,7 +354,7 @@ Rules:
 
 - README use is primarily for `gmk peek`, not for bloating the index
 - the tool may cache a bounded README excerpt and README path metadata for non-kept packages
-- imported README content should be truncated aggressively
+- imported README content should be truncated aggressively and kept compact by default
 - long README text should require paging or an explicit request
 
 ---
@@ -375,8 +383,8 @@ Its job is to answer two questions:
 
 ### `peek` constraints
 
-- default output should stay within about `2 KB`
-- if more content exists, the tool should require paging or an explicit follow-up
+- default output should stay compact by using a bounded subtree preview and a short README excerpt
+- if more content exists, the tool should require a follow-up rather than dumping the full tree or README by default
 - for non-kept packages, lightweight metadata such as README excerpts may be cached separately from full package materialization
 
 `peek` is intentionally lighter than `load`. It exists to save unnecessary materialization and unnecessary directory browsing.
@@ -428,6 +436,7 @@ There is no background sync and no automatic update policy in the core tool.
 - `gmk update <id>` may update one specific package explicitly
 - if a package is frozen, normal update commands do not change its commit unless the user explicitly unfreezes or force-updates it
 - if a package has `subpath`, updating still happens at the repo level because git history lives at the full clone
+- tool-managed clones are disposable mirrors of remote resources, so update intentionally refreshes them even if local edits inside those clones are lost
 
 This keeps package changes deliberate and easy to reason about.
 
@@ -458,11 +467,11 @@ gmk add github.com/you/mega-repo#skills/design
 # List surfaced packages only
 gmk list
 
-# List the full bookmark set
-gmk list-all
+# List the full bookmark set with bounded paging
+gmk list-all --limit 15 --offset 0
 
 # Search across all discoverable packages
-gmk search "design templates"
+gmk search "design templates" --limit 10 --offset 0
 
 # Inspect before loading
 gmk peek design
@@ -613,10 +622,11 @@ These are enough for the common flow:
 
 ### Output discipline still applies
 
-Even through MCP, normal output limits should still hold.
+Even through MCP, normal output discipline should still hold.
 
-- `list`, `list-all`, `search`, and `peek` should still aim for about `2 KB` by default
-- larger responses should require paging or explicit follow-up
+- `list` may print the full pinned favorites set
+- `list-all` and `search` should keep their default paging behavior
+- `peek` should stay compact by default
 
 This keeps the single-tool wrapper useful without flooding the model context.
 

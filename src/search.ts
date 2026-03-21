@@ -53,7 +53,7 @@ function scoreRecord(record: PackageRecord, queryTokens: string[]): number {
   return score;
 }
 
-export function searchPackages(records: PackageRecord[], query: string, limit = 20): SearchHit[] {
+function rankSearchPackages(records: PackageRecord[], query: string): SearchHit[] {
   const queryTokens = tokenize(query);
   if (queryTokens.length === 0) {
     return [];
@@ -68,7 +68,13 @@ export function searchPackages(records: PackageRecord[], query: string, limit = 
         return right.score - left.score;
       }
       return left.record.id.localeCompare(right.record.id);
-    })
-    .slice(0, limit);
+    });
 }
 
+export function searchPackages(records: PackageRecord[], query: string, limit = 20, offset = 0): SearchHit[] {
+  return rankSearchPackages(records, query).slice(offset, offset + limit);
+}
+
+export function countSearchPackages(records: PackageRecord[], query: string): number {
+  return rankSearchPackages(records, query).length;
+}

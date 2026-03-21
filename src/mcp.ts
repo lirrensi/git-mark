@@ -3,8 +3,8 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { getToolPaths } from './env.ts';
-import { loadRuntimeConfig } from './config.ts';
+import { ensureToolDirectories, getBootstrapPaths, resolveToolPaths } from './env.ts';
+import { ensureConfigFile, loadRuntimeConfig } from './config.ts';
 import { loadIndexFile } from './index.ts';
 import { getMcpToolDescription } from './help.ts';
 
@@ -187,9 +187,12 @@ function encodeMessage(payload: JsonRpcResponse): Buffer {
 }
 
 async function loadBootstrapFiles(): Promise<void> {
-  const paths = getToolPaths();
-  await loadRuntimeConfig(paths.configPath);
-  await loadIndexFile(paths.indexPath);
+  const bootstrapPaths = getBootstrapPaths();
+  await ensureConfigFile(bootstrapPaths.configPath);
+  const config = await loadRuntimeConfig(bootstrapPaths.configPath);
+  const paths = resolveToolPaths(bootstrapPaths, config);
+  await ensureToolDirectories(paths);
+  await loadIndexFile(bootstrapPaths.indexPath);
 }
 
 export async function runMcp(): Promise<void> {

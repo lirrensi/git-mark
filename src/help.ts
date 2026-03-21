@@ -2,8 +2,8 @@ const COMMAND_LINES = [
   'gmk add <remote[#subpath]> [--id <id>] [--summary <text>] [--description <text>] [--resource <text>] [--yes]',
   'gmk help',
   'gmk list',
-  'gmk list-all',
-  'gmk search <query>',
+  'gmk list-all [--limit <n>] [--offset <n>]',
+  'gmk search <query> [--limit <n>] [--offset <n>]',
   'gmk peek <id>',
   'gmk load <id>',
   'gmk path <id>',
@@ -25,6 +25,7 @@ export function getCliHelpText(): string {
     'When run in a TTY, `gmk add` inspects the source, previews the fetched files, and asks for missing metadata with arrow-key choices.',
     'Use `--yes` to skip prompts and accept defaults.',
     'Use `gmk pin <id>` and `gmk unpin <id>` to control what surfaces in the global default list.',
+    '`gmk list-all` defaults to `--limit 15 --offset 0`; `gmk search` defaults to `--limit 10 --offset 0`.',
     '',
   ].join('\n');
 }
