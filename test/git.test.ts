@@ -19,38 +19,20 @@ test('runGit reports missing git cleanly', async () => {
 
 test('runGit times out cleanly when git blocks too long', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gitmark-git-timeout-'));
-  const shimDir = path.join(tempDir, 'shim');
-  await fs.mkdir(shimDir);
-
-  const sleepScriptPath = path.join(shimDir, 'sleep.js');
-  await fs.writeFile(sleepScriptPath, 'setTimeout(() => {}, 500);\n', 'utf8');
-
-  if (process.platform === 'win32') {
-    await fs.writeFile(
-      path.join(shimDir, 'git.cmd'),
-      `@echo off\r\n"${process.execPath.replace(/"/g, '""')}" "${sleepScriptPath}"\r\n`,
-      'utf8',
-    );
-  } else {
-    const shimPath = path.join(shimDir, 'git');
-    await fs.writeFile(shimPath, `#!/bin/sh\n"${process.execPath}" "${sleepScriptPath}"\n`, 'utf8');
-    await fs.chmod(shimPath, 0o755);
-  }
+  const sleepScriptPath = path.join(tempDir, 'sleep.js');
+  await fs.writeFile(sleepScriptPath, 'setTimeout(() => {}, 2000);\n', 'utf8');
 
   await assert.rejects(
     () =>
       runGit(['status'], {
-        env: {
-          ...process.env,
-          PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
-          Path: `${shimDir}${path.delimiter}${process.env.Path ?? process.env.PATH ?? ''}`,
-        },
-        timeoutMs: 50,
+        executable: process.execPath,
+        executableArgs: [sleepScriptPath],
+        timeoutMs: 200,
       }),
     (error: unknown) => {
       assert.ok(error instanceof GitMarkError);
       assert.equal(error.code, 'GIT_TIMEOUT');
-      assert.match(error.message, /git status timed out after 0.05 seconds/);
+      assert.match(error.message, /git status timed out after 0.2 seconds/);
       return true;
     },
   );

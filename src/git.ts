@@ -12,6 +12,8 @@ export interface GitOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  executable?: string;
+  executableArgs?: string[];
 }
 
 let gitAvailability: Promise<void> | null = null;
@@ -28,7 +30,9 @@ export function gitEnv(allowLfs: boolean): NodeJS.ProcessEnv {
 export function runGit(args: string[], options: GitOptions = {}): Promise<GitResult> {
   return new Promise((resolve, reject) => {
     const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
-    const child = spawn('git', args, {
+    const executable = options.executable ?? 'git';
+    const executableArgs = options.executableArgs ?? [];
+    const child = spawn(executable, [...executableArgs, ...args], {
       cwd: options.cwd,
       env: options.env,
       stdio: ['ignore', 'pipe', 'pipe'],

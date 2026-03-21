@@ -58,14 +58,19 @@ test('runCli accepts the help aliases', async () => {
   }
 });
 
-test('MCP tool description explains the command payload and includes an example payload', () => {
+test('MCP tool description explains the command payload and includes quick-help sections', () => {
   const description = getMcpToolDescription([makePinnedRecord(1, { id: 'design' })]);
 
-  assert.match(description, /Send one `command` string/);
-  assert.match(description, /text that would follow `gmk`/);
-  assert.match(description, /\{ "command": "search design templates" \}/);
-  assert.match(description, /Pinned resources:/);
-  assert.match(description, /design/);
+  assert.match(description, /CLI-style wrapper/);
+  assert.match(description, /send one `command` string with what would follow `gmk`/);
+  assert.match(description, /Most used:/);
+  assert.match(description, /\{ "command": "list" \}/);
+  assert.match(description, /\{ "command": "search design" \}/);
+  assert.match(description, /\{ "command": "load design" \}/);
+  assert.match(description, /What to expect:/);
+  assert.match(description, /Available resources:/);
+  assert.doesNotMatch(description, /Pinned resources:/);
+  assert.match(description, /design \|/);
 });
 
 test('MCP tool description renders compact pinned package lines without technical flags', () => {
@@ -79,7 +84,7 @@ test('MCP tool description renders compact pinned package lines without technica
     }),
   ]);
 
-  assert.match(description, /design Design templates for pr/);
+  assert.match(description, /design \| Design templates for pr/);
   assert.doesNotMatch(description, /kept|frozen|live|pinned/);
 });
 
@@ -101,7 +106,7 @@ test('MCP tool description reports the exact overflow count and includes gmk lis
     .filter((line) => line.startsWith('pkg-'));
 
   assert.equal(pinnedLines.length, 15);
-  assert.match(description, /3 more pinned resources\./);
+  assert.match(description, /3 more available resources\./);
   assert.match(description, /`gmk list`/);
   assert.doesNotMatch(description, /pkg-16/);
 });
@@ -109,5 +114,5 @@ test('MCP tool description reports the exact overflow count and includes gmk lis
 test('MCP tool description renders a concise zero-pinned fallback', () => {
   const description = getMcpToolDescription([]);
 
-  assert.match(description, /Pinned resources: none yet\./);
+  assert.match(description, /Available resources: none yet\./);
 });
