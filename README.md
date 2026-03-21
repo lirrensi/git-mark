@@ -56,11 +56,17 @@ Requirements:
 - Node.js 24+
 - `git` on your `PATH`
 
-If the package is published where you install tools from:
+Install globally from GitHub:
 
 ```bash
-npm install -g git-mark
+npm install -g github:lirrensi/git-mark
 gmk help
+```
+
+Run it once with `npx` without a global install:
+
+```bash
+npx --package github:lirrensi/git-mark gmk help
 ```
 
 From this repository:
