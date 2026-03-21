@@ -5,15 +5,14 @@
     "description": "Bookmark manager for git-backed resources.",
     "type": "module",
     "bin": {
-        "gmk": "./dist/cli.js",
-        "git-mark-mcp": "./dist/mcp.js"
+        "gmk": "./bin/gmk.cjs",
+        "git-mark-mcp": "./bin/git-mark-mcp.cjs"
     },
     "scripts": {
-        "dev": "node --experimental-strip-types src/cli.ts",
-        "start": "node --experimental-strip-types src/cli.ts",
-        "mcp": "node --experimental-strip-types src/mcp.ts",
-        "build": "npx --yes --package typescript tsc -p tsconfig.json",
-        "prepare": "npm run build",
+        "dev": "node --import tsx src/cli.ts",
+        "start": "node --import tsx src/cli.ts",
+        "mcp": "node --import tsx src/mcp.ts",
+        "compile": "npx --yes --package typescript tsc -p tsconfig.json",
         "typecheck": "npx --yes --package typescript tsc -p tsconfig.json --noEmit",
         "test": "node --experimental-strip-types --test test/*.test.ts"
     },
@@ -21,13 +20,15 @@
         "node": ">=24.0.0"
     },
     "dependencies": {
-        "@inquirer/prompts": "^8.3.2"
+        "@inquirer/prompts": "^8.3.2",
+        "tsx": "^4.20.5"
     },
     "devDependencies": {
         "@types/node": "^25.5.0"
     },
     "files": [
-        "dist",
+        "bin",
+        "src",
         "README.md",
         "LICENSE"
     ]

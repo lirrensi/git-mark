@@ -56,7 +56,7 @@ Requirements:
 - Node.js 24+
 - `git` on your `PATH`
 
-Git-based installs build the published JavaScript during install.
+Git-based installs now run the TypeScript entrypoints through bundled `tsx` at runtime, so git installs do not need an install-time build step.
 
 ### npm
 
@@ -69,10 +69,8 @@ gmk help
 
 ### pnpm
 
-`pnpm` may require a per-package allow-build flag for git installs because this package builds itself during git install.
-
 ```bash
-pnpm add -g --allow-build=git-mark github:lirrensi/git-mark
+pnpm add -g github:lirrensi/git-mark
 gmk help
 ```
 
@@ -94,8 +92,8 @@ From this repository:
 
 ```bash
 npm install
-pnpm build
-node dist/cli.js help
+node bin/gmk.cjs help
+node --import tsx src/mcp.ts
 ```
 
 Available binaries:
@@ -437,7 +435,7 @@ git-mark-mcp
 If you are running from the repo for local development instead of an installed binary:
 
 ```bash
-node --experimental-strip-types src/mcp.ts
+node bin/git-mark-mcp.cjs
 ```
 
 The advertised tool is `git_mark` with an input shape like:
