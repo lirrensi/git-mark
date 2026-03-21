@@ -31,5 +31,10 @@
         "dist",
         "README.md",
         "LICENSE"
-    ]
+    ],
+    "pnpm": {
+        "onlyBuiltDependencies": [
+            "git-mark"
+        ]
+    }
 }
