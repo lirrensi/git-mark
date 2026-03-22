@@ -32,7 +32,7 @@ In short: browser bookmarks made sense for humans on the web; `git-mark` does th
 
 ## Core idea
 
-- Canonical package truth lives in `~/.gitmarks.toml`.
+- Canonical package truth lives in `~/.gitmark/index.toml`.
 - Runtime policy lives in `~/.gitmark/config.toml`.
 - Clones, temp directories, logs, and runtime state are derived and rebuildable.
 - The CLI is the primary interface.
@@ -103,6 +103,24 @@ Available binaries:
 - `git-mark` - full command alias for the CLI entry point
 - `gmk` - CLI entry point
 - `git-mark-mcp` - MCP server entry point
+
+## How to run it
+
+There are three practical ways to run `git-mark`. `npx` is useful, but it is only one option.
+
+| Mode | Best for | CLI example | MCP example |
+|---|---|---|---|
+| Global install | regular daily use | `gmk help` | `git-mark-mcp` |
+| `npx` one-off | trying it without a global install | `npx --package github:lirrensi/git-mark gmk help` | `npx --package github:lirrensi/git-mark git-mark-mcp` |
+| From this repo | local development on `git-mark` itself | `node bin/gmk.cjs help` | `node --import tsx src/mcp.ts` |
+
+The important distinction is:
+
+- the CLI is the main product surface
+- MCP is one integration transport for clients that want it
+- `npx` is one execution mode, not the default mental model for the tool
+
+If you already installed globally, run `gmk` or `git-mark-mcp` directly. If you have not installed globally, `npx --package ...` lets you run the same package on demand.
 
 ## Quick start
 
@@ -256,7 +274,7 @@ What they are for:
 - `freeze` and `unfreeze` control commit pinning.
 - `remove` / `rm` delete a bookmark and reconcile local derived state.
 - `doctor`, `cleanup`, and `sync` keep runtime state healthy.
-- `edit` opens `~/./gitmark/index.toml` in your editor.
+- `edit` opens `~/.gitmark/index.toml` in your editor.
 
 ## Add and load examples
 
@@ -293,12 +311,39 @@ printf '%s\n' "$RESOURCE_PATH"
 
 ## Runtime files
 
-- Index: `~/.gitmarks.toml`
+- Index: `~/.gitmark/index.toml`
 - Config: `~/.gitmark/config.toml`
 - Logs: `~/.gitmark/history.log`
 - State: `~/.gitmark/state.json`
 
 By default, kept repos live under the runtime storage root and temp materializations live under the temp root. Those locations are derived runtime state, not canonical data.
+
+You usually do not need to edit `~/.gitmark/index.toml` manually. Commands like `gmk add`, `gmk remove`, `gmk pin`, and `gmk freeze` manage it for you. Manual editing is mainly an escape hatch for import/export, bulk cleanup, or deliberate low-level repair.
+
+## How state works
+
+`git-mark` is easiest to reason about if you separate canonical user-owned data from tool-managed derived state.
+
+| Path / state | Role | Normal way it changes |
+|---|---|---|
+| `~/.gitmark/index.toml` | canonical bookmark catalog | `add`, `remove`, `pin`, `unpin`, `freeze`, `unfreeze`, occasional manual repair |
+| `~/.gitmark/config.toml` | canonical runtime policy | usually edited rarely by the user |
+| `~/.gitmark/state.json` | derived runtime metadata and cached artifacts | `peek`, `load`, `update`, `updateall`, `sync`, recovery flows |
+| kept repo directories | derived stable materializations | `load`, `update`, `sync`, `remove` |
+| temp materializations | derived disposable working state | `peek`, `load`, `cleanup`, automatic temp pruning |
+| `~/.gitmark/history.log` | derived operational history | normal command execution |
+
+Command shape at a glance:
+
+| Command | Canonical data | Derived state |
+|---|---|---|
+| `add` | writes a new record | may inspect and cache artifacts |
+| `peek` | no change | may create transient inspection state |
+| `load` | no change | materializes repo state and returns a visible path |
+| `update` / `updateall` | no change | refreshes managed clones and cached artifacts |
+| `sync` | no change | reconciles and materializes kept repos |
+| `cleanup` | no change | removes temp state and orphan runtime data |
+| `doctor` | no change | reports runtime issues without mutating anything |
 
 ## Coding-agent usage
 
@@ -338,7 +383,7 @@ There are three practical integration levels.
 
 ### 1. MCP: the simple default
 
-If your agent host supports MCP, use the shipped MCP server first. This is the easiest path and usually the nicest one. 🌸
+If your agent host supports MCP, use the shipped MCP server first. This is the easiest path for many existing clients, especially ones that already know how to speak MCP. 🌸
 
 Why this is the best default:
 
@@ -349,9 +394,12 @@ Why this is the best default:
 
 Typical setup shape:
 
-- start `git-mark-mcp`
+- start `git-mark-mcp` if installed globally
+- or start `npx --package github:lirrensi/git-mark git-mark-mcp` for a one-off run
 - register it in your MCP-capable host
 - let the host expose the `git_mark` tool to the agent
+
+MCP is only one integration path. It is the classic drop-in way to expose `git-mark` to compatible hosts, but the underlying catalog and load model also work through direct CLI use, skills, prompts, or native host integrations.
 
 Once connected, the host can call commands like:
 
@@ -404,6 +452,8 @@ That model is what keeps the resource universe broad without making agent contex
 
 Why build this deeper version: if you control the host, `git-mark` can become a first-class resource layer sitting right beside skills, tools, and workspace files instead of being "just another command." 🧩
 
+Across all three integration levels, the core capability stays the same: `git-mark` gives a host or agent a searchable catalog of git-backed resources and a way to turn a selected entry into a local filesystem path.
+
 ## MCP integration
 
 `git-mark` also ships a single-tool MCP server for hosts that prefer MCP.
@@ -435,6 +485,12 @@ Start the server:
 git-mark-mcp
 ```
 
+Run it one-off without a global install:
+
+```bash
+npx --package github:lirrensi/git-mark git-mark-mcp
+```
+
 If you are running from the repo for local development instead of an installed binary:
 
 ```bash
@@ -458,6 +514,36 @@ More examples:
 What comes back is text output from the CLI, with MCP marking the call as an error if the underlying CLI command exits non-zero.
 
 The tool description also includes a compact view of currently pinned bookmarks so agents can see likely-useful resources before making a call.
+
+## Design tradeoffs
+
+`git-mark` makes a few opinionated choices on purpose.
+
+### Why local lexical search instead of embeddings or remote search
+
+- it keeps discovery local-first and predictable
+- it avoids adding a service dependency, database, or background indexing system
+- it keeps the source of truth inspectable and portable instead of tying usefulness to hosted infrastructure
+
+The goal is not to be the smartest possible search system. The goal is to be a reliable catalog that works on an ordinary machine with ordinary files.
+
+### Why a single MCP tool instead of one tool per command
+
+- it keeps the MCP schema compact
+- it keeps CLI and MCP behavior aligned
+- it avoids duplicating command logic across two interfaces
+- it works well for clients that mostly need one structured resource tool
+
+In other words, MCP here is a transport wrapper, not a second product surface.
+
+### Why full clone plus returned subpath instead of partial repo modeling
+
+- git already understands repositories better than a custom partial-resource layer would
+- full clones keep update behavior simple and predictable
+- returning a subpath still gives the caller the specific entry point it wanted
+- it preserves normal filesystem and git semantics after materialization
+
+That tradeoff favors operational simplicity over stricter isolation. A selected subpath is a convenience entry point inside a real repo, not a sandbox boundary.
 
 ## Suggested agent rollout
 

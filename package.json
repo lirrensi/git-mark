@@ -1,6 +1,6 @@
 {
     "name": "git-mark",
-    "version": "0.5.0",
+    "version": "0.5.3",
     "private": false,
     "description": "Bookmark manager for git-backed resources.",
     "type": "module",
@@ -22,6 +22,7 @@
     },
     "dependencies": {
         "@inquirer/prompts": "^8.3.2",
+        "@modelcontextprotocol/sdk": "^1.27.1",
         "minisearch": "^7.2.0",
         "tsx": "^4.21.0"
     },

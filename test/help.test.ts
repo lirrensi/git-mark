@@ -121,17 +121,30 @@ test('MCP tool description renders a concise zero-pinned fallback', () => {
 
 test('MCP tool input schema exposes only list, search, peek, and load', () => {
   const schema = getMcpToolInputSchema() as {
-    oneOf?: Array<{
-      properties?: {
-        action?: {
-          enum?: string[];
-        };
+    type?: string;
+    oneOf?: unknown;
+    anyOf?: unknown;
+    allOf?: unknown;
+    properties?: {
+      action?: {
+        enum?: string[];
       };
-      required?: string[];
-    }>;
+      query?: {
+        type?: string;
+      };
+      id?: {
+        type?: string;
+      };
+    };
+    required?: string[];
   };
 
-  assert.ok(Array.isArray(schema.oneOf));
-  const actionSets = schema.oneOf?.map((entry) => entry.properties?.action?.enum ?? []).flat();
-  assert.deepEqual(actionSets?.sort(), ['list', 'load', 'peek', 'search']);
+  assert.equal(schema.type, 'object');
+  assert.equal(schema.oneOf, undefined);
+  assert.equal(schema.anyOf, undefined);
+  assert.equal(schema.allOf, undefined);
+  assert.deepEqual(schema.properties?.action?.enum, ['list', 'search', 'peek', 'load']);
+  assert.equal(schema.properties?.query?.type, 'string');
+  assert.equal(schema.properties?.id?.type, 'string');
+  assert.deepEqual(schema.required, ['action']);
 });

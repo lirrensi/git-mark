@@ -74,64 +74,34 @@ export function getMcpToolInputSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    oneOf: [
-      {
-        type: 'object',
-        properties: {
-          action: {
-            type: 'string',
-            enum: ['list'],
-            description: 'Return the pinned package list.',
-          },
-        },
-        required: ['action'],
-        additionalProperties: false,
+    properties: {
+      action: {
+        type: 'string',
+        enum: [...MCP_ALLOWED_ACTIONS],
+        description: 'Action to run. Use list, search, peek, or load.',
       },
-      {
-        type: 'object',
-        properties: {
-          action: {
-            type: 'string',
-            enum: ['search'],
-            description: 'Search discoverable packages by text query.',
-          },
-          query: {
-            type: 'string',
-            minLength: 1,
-            description: 'Search terms.',
-          },
-          limit: {
-            type: 'integer',
-            minimum: 1,
-            description: 'Optional maximum result count.',
-          },
-          offset: {
-            type: 'integer',
-            minimum: 0,
-            description: 'Optional result offset.',
-          },
-        },
-        required: ['action', 'query'],
-        additionalProperties: false,
+      query: {
+        type: 'string',
+        minLength: 1,
+        description: 'Required when action is search.',
       },
-      {
-        type: 'object',
-        properties: {
-          action: {
-            type: 'string',
-            enum: ['peek', 'load'],
-            description: 'Inspect or materialize a package by id.',
-          },
-          id: {
-            type: 'string',
-            minLength: 1,
-            description: 'Package id.',
-          },
-        },
-        required: ['action', 'id'],
-        additionalProperties: false,
+      id: {
+        type: 'string',
+        minLength: 1,
+        description: 'Required when action is peek or load.',
       },
-    ],
+      limit: {
+        type: 'integer',
+        minimum: 1,
+        description: 'Optional maximum result count for search.',
+      },
+      offset: {
+        type: 'integer',
+        minimum: 0,
+        description: 'Optional result offset for search.',
+      },
+    },
+    required: ['action'],
   };
 }
 

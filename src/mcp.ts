@@ -1,33 +1,21 @@
 #!/usr/bin/env -S node --experimental-strip-types
 import { execFile } from 'node:child_process';
-import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { ensureToolDirectories, getBootstrapPaths, resolveToolPaths } from './env.ts';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { ensureConfigFile, loadRuntimeConfig } from './config.ts';
-import { loadIndexFile } from './index.ts';
+import { ensureToolDirectories, getBootstrapPaths, resolveToolPaths } from './env.ts';
 import { getMcpToolDescription, getMcpToolInputSchema } from './help.ts';
+import { loadIndexFile } from './index.ts';
+import { buildNodeLaunchCommand, resolveSiblingEntry } from './runtime.ts';
 import type { PackageRecord } from './types.ts';
 
 const execFileAsync = promisify(execFile);
-const currentFile = fileURLToPath(import.meta.url);
-const isTypeScriptEntry = currentFile.endsWith('.ts');
-const cliEntry = path.join(path.dirname(currentFile), isTypeScriptEntry ? 'cli.ts' : 'cli.js');
+const cliEntry = resolveSiblingEntry(import.meta.url, 'cli');
 const MCP_TOOL_NAME = 'git_mark';
-
-interface JsonRpcRequest {
-  jsonrpc?: string;
-  id?: string | number | null;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
-interface JsonRpcResponse {
-  jsonrpc: '2.0';
-  id: string | number | null;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-}
 
 type McpAction = 'list' | 'search' | 'peek' | 'load';
 
@@ -39,13 +27,25 @@ interface ParsedMcpCall {
   offset?: number;
 }
 
+interface CliExecutionResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+interface McpDependencies {
+  loadBootstrapFiles: () => Promise<void>;
+  buildToolDescription: () => Promise<string>;
+  runMcpAction: (call: ParsedMcpCall) => Promise<CliExecutionResult>;
+}
+
 function parseInteger(value: unknown, field: string, minimum: number): number | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
   const parsed = typeof value === 'number' ? value : typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : Number.NaN;
   if (!Number.isInteger(parsed) || parsed < minimum) {
-    throw new Error(`Invalid ${field}: expected an integer >= ${minimum}.`);
+    throw new McpError(-32602, `Invalid ${field}: expected an integer >= ${minimum}.`);
   }
   return parsed;
 }
@@ -56,47 +56,48 @@ function parseString(value: unknown, field: string): string | undefined {
   }
   const trimmed = value.trim();
   if (!trimmed) {
-    throw new Error(`Invalid ${field}: expected a non-empty string.`);
+    throw new McpError(-32602, `Invalid ${field}: expected a non-empty string.`);
   }
   return trimmed;
 }
 
-function parseMcpCallArguments(raw: unknown): ParsedMcpCall {
+export function parseMcpCallArguments(raw: unknown): ParsedMcpCall {
   if (!raw || typeof raw !== 'object') {
-    throw new Error('Invalid arguments: expected an object.');
+    throw new McpError(-32602, 'Invalid arguments: expected an object.');
   }
 
   const values = raw as Record<string, unknown>;
   const action = parseString(values.action, 'action');
-  if (!action || !['list', 'search', 'peek', 'load'].includes(action)) {
-    throw new Error('Invalid action: expected list, search, peek, or load.');
+  if (!action || !(['list', 'search', 'peek', 'load'] as const).includes(action as McpAction)) {
+    throw new McpError(-32602, 'Invalid action: expected list, search, peek, or load.');
+  }
+  const typedAction = action as McpAction;
+
+  if (typedAction === 'list') {
+    return { action: typedAction };
   }
 
-  if (action === 'list') {
-    return { action };
-  }
-
-  if (action === 'search') {
+  if (typedAction === 'search') {
     const query = parseString(values.query, 'query');
     if (!query) {
-      throw new Error('Invalid query: expected a non-empty string.');
+      throw new McpError(-32602, 'Invalid query: expected a non-empty string.');
     }
     const limit = parseInteger(values.limit, 'limit', 1);
     const offset = parseInteger(values.offset, 'offset', 0);
-    return { action, query, limit, offset };
+    return { action: typedAction, query, limit, offset };
   }
 
   const id = parseString(values.id, 'id');
   if (!id) {
-    throw new Error('Invalid id: expected a non-empty string.');
+    throw new McpError(-32602, 'Invalid id: expected a non-empty string.');
   }
-  return { action, id };
+  return { action: typedAction, id };
 }
 
-async function runCliArgs(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+async function runCliArgs(args: string[]): Promise<CliExecutionResult> {
+  const delegatedCli = buildNodeLaunchCommand(cliEntry, args);
   try {
-    const nodeArgs = isTypeScriptEntry ? ['--experimental-strip-types', cliEntry, ...args] : [cliEntry, ...args];
-    const result = await execFileAsync(process.execPath, nodeArgs, {
+    const result = await execFileAsync(delegatedCli.command, delegatedCli.args, {
       encoding: 'utf8',
       env: { ...process.env },
       maxBuffer: 10 * 1024 * 1024,
@@ -107,16 +108,23 @@ async function runCliArgs(args: string[]): Promise<{ stdout: string; stderr: str
       exitCode: 0,
     };
   } catch (error) {
-    const captured = error as { stdout?: string; stderr?: string; code?: number };
+    const captured = error as { stdout?: string; stderr?: string; code?: number | string };
+    const stderr = String(captured.stderr ?? '').trim();
+    const startupFailure =
+      stderr.length > 0
+        ? stderr
+        : error instanceof Error
+          ? `Failed to start delegated CLI: ${error.message}`
+          : `Failed to start delegated CLI: ${String(error)}`;
     return {
       stdout: String(captured.stdout ?? ''),
-      stderr: String(captured.stderr ?? (error instanceof Error ? error.message : String(error))),
+      stderr: startupFailure,
       exitCode: typeof captured.code === 'number' ? captured.code : 1,
     };
   }
 }
 
-async function runMcpAction(call: ParsedMcpCall): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+async function runMcpAction(call: ParsedMcpCall): Promise<CliExecutionResult> {
   switch (call.action) {
     case 'list':
       return runCliArgs(['list']);
@@ -147,100 +155,6 @@ async function buildToolDescription(): Promise<string> {
   return getMcpToolDescription(pinnedRecords);
 }
 
-async function handleRequest(request: JsonRpcRequest): Promise<JsonRpcResponse | null> {
-  if (request.method === 'initialize') {
-    return {
-      jsonrpc: '2.0',
-      id: request.id ?? null,
-      result: {
-        protocolVersion: String(request.params?.protocolVersion ?? '2024-11-05'),
-        serverInfo: {
-          name: 'git-mark',
-          version: '0.2.0',
-        },
-        capabilities: {
-          tools: {},
-        },
-      },
-    };
-  }
-
-  if (request.method === 'tools/list') {
-    const description = await buildToolDescription();
-    return {
-      jsonrpc: '2.0',
-      id: request.id ?? null,
-      result: {
-        tools: [
-          {
-            name: MCP_TOOL_NAME,
-            description,
-            inputSchema: getMcpToolInputSchema(),
-          },
-        ],
-      },
-    };
-  }
-
-  if (request.method === 'tools/call') {
-    const toolName = String(request.params?.name ?? '');
-    if (toolName !== MCP_TOOL_NAME) {
-      return {
-        jsonrpc: '2.0',
-        id: request.id ?? null,
-        error: { code: -32601, message: `Unknown tool: ${toolName}` },
-      };
-    }
-    let call: ParsedMcpCall;
-    try {
-      call = parseMcpCallArguments(request.params?.arguments);
-    } catch (error) {
-      return {
-        jsonrpc: '2.0',
-        id: request.id ?? null,
-        error: {
-          code: -32602,
-          message: error instanceof Error ? error.message : String(error),
-        },
-      };
-    }
-    const result = await runMcpAction(call);
-    const text = [result.stdout.trimEnd(), result.stderr.trimEnd()].filter(Boolean).join('\n');
-    return {
-      jsonrpc: '2.0',
-      id: request.id ?? null,
-      result: {
-        content: [
-          {
-            type: 'text',
-            text: text.length > 0 ? text : result.exitCode === 0 ? '' : `command exited with code ${result.exitCode}`,
-          },
-        ],
-        isError: result.exitCode !== 0,
-      },
-    };
-  }
-
-  if (request.method === 'shutdown' || request.method === 'exit') {
-    return {
-      jsonrpc: '2.0',
-      id: request.id ?? null,
-      result: null,
-    };
-  }
-
-  return {
-    jsonrpc: '2.0',
-    id: request.id ?? null,
-    error: { code: -32601, message: `Unknown method: ${request.method}` },
-  };
-}
-
-function encodeMessage(payload: JsonRpcResponse): Buffer {
-  const body = JSON.stringify(payload);
-  return Buffer.from(`Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`, 'utf8');
-}
-
 async function loadBootstrapFiles(): Promise<void> {
   const bootstrapPaths = getBootstrapPaths();
   await ensureConfigFile(bootstrapPaths.configPath);
@@ -250,70 +164,78 @@ async function loadBootstrapFiles(): Promise<void> {
   await loadIndexFile(bootstrapPaths.indexPath);
 }
 
-export async function runMcp(): Promise<void> {
-  await loadBootstrapFiles();
+function formatToolResult(result: CliExecutionResult): { content: Array<{ type: 'text'; text: string }>; isError: boolean } {
+  const text = [result.stdout.trimEnd(), result.stderr.trimEnd()].filter(Boolean).join('\n');
+  return {
+    content: [
+      {
+        type: 'text',
+        text: text.length > 0 ? text : result.exitCode === 0 ? '' : `command exited with code ${result.exitCode}`,
+      },
+    ],
+    isError: result.exitCode !== 0,
+  };
+}
 
-  let buffer = Buffer.alloc(0);
-  let exiting = false;
-  let processing = Promise.resolve();
-
-  const send = (message: JsonRpcResponse): void => {
-    process.stdout.write(encodeMessage(message));
+export function createMcpServer(deps: Partial<McpDependencies> = {}): Server {
+  const resolvedDeps: McpDependencies = {
+    loadBootstrapFiles,
+    buildToolDescription,
+    runMcpAction,
+    ...deps,
   };
 
-  const parseBuffer = async (): Promise<void> => {
-    while (true) {
-      const separator = buffer.indexOf(Buffer.from('\r\n\r\n'));
-      if (separator === -1) {
-        return;
-      }
-      const headerText = buffer.slice(0, separator).toString('utf8');
-      const match = headerText.match(/Content-Length:\s*(\d+)/i);
-      if (!match) {
-        return;
-      }
-      const contentLength = Number(match[1]);
-      const bodyStart = separator + 4;
-      if (buffer.length < bodyStart + contentLength) {
-        return;
-      }
-      const body = buffer.slice(bodyStart, bodyStart + contentLength).toString('utf8');
-      buffer = buffer.slice(bodyStart + contentLength);
-      const request = JSON.parse(body) as JsonRpcRequest;
-      const response = await handleRequest(request);
-      if (response) {
-        send(response);
-      }
-      if (request.method === 'exit') {
-        exiting = true;
-      }
+  const server = new Server(
+    { name: 'git-mark', version: '0.2.0' },
+    {
+      capabilities: {
+        tools: {},
+      },
+    },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: MCP_TOOL_NAME,
+        description: await resolvedDeps.buildToolDescription(),
+        inputSchema: getMcpToolInputSchema(),
+      },
+    ],
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name !== MCP_TOOL_NAME) {
+      throw new McpError(-32601, `Unknown tool: ${request.params.name}`);
     }
+
+    const call = parseMcpCallArguments(request.params.arguments);
+    const result = await resolvedDeps.runMcpAction(call);
+    return formatToolResult(result);
+  });
+
+  return server;
+}
+
+export async function startMcpServer(
+  transport: Transport = new StdioServerTransport(),
+  deps: Partial<McpDependencies> = {},
+): Promise<Server> {
+  const resolvedDeps: McpDependencies = {
+    loadBootstrapFiles,
+    buildToolDescription,
+    runMcpAction,
+    ...deps,
   };
 
-  process.stdin.resume();
-  process.stdin.on('data', (chunk: Buffer) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    processing = processing
-      .then(() => parseBuffer())
-      .catch((error) => {
-        send({
-          jsonrpc: '2.0',
-          id: null,
-          error: {
-            code: -32603,
-            message: error instanceof Error ? error.message : String(error),
-          },
-        });
-      });
-  });
+  await resolvedDeps.loadBootstrapFiles();
+  const server = createMcpServer(resolvedDeps);
+  await server.connect(transport);
+  return server;
+}
 
-  process.stdin.on('end', () => {
-    void processing.then(() => {
-      if (exiting) {
-        process.exit(0);
-      }
-    });
-  });
+export async function runMcp(): Promise<void> {
+  await startMcpServer();
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository implements `git-mark` as a small Node.js 24+ TypeScript CLI with a thin MCP adapter. The implementation is intentionally local-first: it reads a user-owned TOML index under `~/.gitmark`, maintains derived runtime state under the same storage root, shells out to the system `git` executable for remote operations, and returns filesystem paths to callers. The MCP layer is not a general command runner; it exposes a schema-validated action subset for `list`, `search`, `peek`, and `load`.
+This repository implements `git-mark` as a small Node.js 24+ TypeScript CLI with a thin MCP adapter built on the official Model Context Protocol SDK over stdio. The implementation is intentionally local-first: it reads a user-owned TOML index under `~/.gitmark`, maintains derived runtime state under the same storage root, shells out to the system `git` executable for remote operations, and returns filesystem paths to callers. The MCP layer is not a general command runner; it exposes a schema-validated action subset for `list`, `search`, `peek`, and `load`.
 
 The architecture is simple enough to keep in a single file. Most behavior lives in a shared service module used by both the CLI and the MCP wrapper.
 
@@ -10,9 +10,9 @@ The architecture is simple enough to keep in a single file. Most behavior lives 
 
 **Owns**: CLI parsing, TOML index/config IO, search ranking, materialization state, lock coordination, hook dispatch, git command orchestration, structured MCP delegation to the CLI
 
-**Does not own**: git server behavior, remote repository contents, editor behavior, MCP host lifecycle beyond the JSON-RPC server contract
+**Does not own**: git server behavior, remote repository contents, editor behavior, MCP host lifecycle beyond the MCP SDK server contract
 
-**Boundary interfaces**: local filesystem, `git` executable, optional TypeScript hook module, stdio JSON-RPC for MCP, spawned editor process
+**Boundary interfaces**: local filesystem, `git` executable, optional TypeScript hook module, MCP SDK stdio transport, spawned editor process
 
 ## Components
 
@@ -21,7 +21,7 @@ The architecture is simple enough to keep in a single file. Most behavior lives 
 | Path | Responsibility |
 |---|---|
 | `src/cli.ts` | CLI argument parsing, output formatting, command dispatch, writer-lock wrapping |
-| `src/mcp.ts` | Single-tool MCP server that delegates to the CLI |
+| `src/mcp.ts` | Single-tool MCP server bootstrapped through the official SDK and delegating to the CLI |
 
 ### Core services
 
@@ -124,12 +124,13 @@ Under the effective storage root:
 ### MCP flow
 
 1. `src/mcp.ts` boots the same bootstrap files as the CLI
-2. `tools/list` builds one tool description from currently pinned records via `src/help.ts`
-3. `tools/call` accepts a structured action payload and validates it before execution
-4. The server spawns `node --experimental-strip-types src/cli.ts ...args`
-5. The MCP surface exposes read-only discovery plus `load`; mutating commands are not surfaced
-6. Stdout and stderr are merged into a text result and flagged as error when exit status is non-zero
-7. Arbitrary shell execution is intentionally out of scope for MCP; if a deployment needs that capability, it should be exposed separately through a permissioned shell tool rather than by widening the MCP schema
+2. `src/mcp.ts` creates an SDK `Server`, advertises the `tools` capability, and connects it through the SDK stdio transport
+3. `tools/list` is handled by the SDK server and builds one tool description from currently pinned records via `src/help.ts`
+4. `tools/call` is handled by the SDK server, accepts a structured action payload, and validates it before execution
+5. Tool execution spawns `node --experimental-strip-types src/cli.ts ...args`
+6. The MCP surface exposes read-only discovery plus `load`; mutating commands are not surfaced
+7. Stdout and stderr are merged into a text result and flagged as error when exit status is non-zero
+8. Arbitrary shell execution is intentionally out of scope for MCP; if a deployment needs that capability, it should be exposed separately through a permissioned shell tool rather than by widening the MCP schema
 
 ### Search flow
 
@@ -155,11 +156,12 @@ Under the effective storage root:
 - Optional local editor from `VISUAL` or `EDITOR`
 - Optional hook module loaded through native module import
 - `@inquirer/prompts` for interactive add flows
+- `@modelcontextprotocol/sdk` for the MCP server, request lifecycle, and stdio transport
 
 ### Internal dependency shape
 
 - `src/cli.ts` depends on almost every other internal module and is the orchestration root
-- `src/mcp.ts` depends on bootstrap helpers, index loading, and help-text generation, but delegates command execution back to the CLI
+- `src/mcp.ts` depends on the MCP SDK, bootstrap helpers, index loading, and help-text generation, but delegates command execution back to the CLI
 - `src/index.ts` is the main domain layer and depends on filesystem, git, TOML, env, lock inspection helpers, and artifact extraction helpers
 - `src/search.ts` depends on MiniSearch and builds a transient in-memory index from canonical records plus cached runtime artifacts
 
@@ -231,6 +233,12 @@ Confidence: High
 
 The MCP server does not duplicate command logic. It shells out to the CLI and exposes one tool to minimize schema surface and keep behavior aligned.
 
+### Official MCP SDK transport
+
+Confidence: High
+
+The MCP adapter relies on the official SDK for initialize handling, stdio message transport, and request dispatch instead of maintaining custom JSON-RPC framing in-repo. This keeps the tool contract stable while reducing protocol-surface maintenance inside `src/mcp.ts`.
+
 ### Custom lightweight TOML parser
 
 Confidence: Medium
@@ -248,6 +256,7 @@ Confidence: High
 - Unit tests cover TOML parsing, search ranking, add UX helpers, help text, pinning, and git wrappers
 - Runtime tests cover hook loading, state recovery, reconciliation, cleanup, and sync behavior
 - Lock tests cover contention timeouts and stale-lock recovery
+- MCP protocol tests cover SDK-driven initialize, tool listing, and tool calling behavior over in-memory transports
 - Optional e2e coverage exists for a real remote clone when explicitly enabled by environment variable
 
 ## Implementation Pointers
