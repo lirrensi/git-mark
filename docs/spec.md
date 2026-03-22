@@ -2,7 +2,7 @@
 
 ## Abstract
 
-This document specifies the observable behavior of `git-mark`, a CLI-first bookmark manager for git-backed resources. A conforming implementation stores bookmark truth in a TOML index, supports local lexical discovery, materializes bookmarked resources into managed local clones, and exposes a thin single-tool MCP wrapper over the same command surface.
+This document specifies the observable behavior of `git-mark`, a CLI-first bookmark manager for git-backed resources. A conforming implementation stores bookmark truth in a TOML index, supports local lexical discovery, materializes bookmarked resources into managed local clones, and exposes a thin single-tool MCP compatibility wrapper over a structured action subset of the CLI surface for hosts that do not integrate with the CLI directly.
 
 ## Introduction
 
@@ -118,7 +118,8 @@ A conforming implementation:
 - MUST use lexical local search rather than requiring a remote or semantic search backend
 - MUST expose kept and temp materialization modes
 - MUST preserve the distinction between `pinned`, `kept`, `discoverable`, and `frozen`
-- MUST support a thin MCP wrapper with one tool accepting a CLI-style command string
+- MUST support a thin MCP compatibility wrapper with one tool accepting a structured action object
+- MUST expose only read-only discovery actions plus `load` through MCP
 - MUST fail clearly on malformed index or config files
 
 ## Behavioral Specification

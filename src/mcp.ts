@@ -6,13 +6,14 @@ import { promisify } from 'node:util';
 import { ensureToolDirectories, getBootstrapPaths, resolveToolPaths } from './env.ts';
 import { ensureConfigFile, loadRuntimeConfig } from './config.ts';
 import { loadIndexFile } from './index.ts';
-import { getMcpToolDescription } from './help.ts';
+import { getMcpToolDescription, getMcpToolInputSchema } from './help.ts';
 import type { PackageRecord } from './types.ts';
 
 const execFileAsync = promisify(execFile);
 const currentFile = fileURLToPath(import.meta.url);
 const isTypeScriptEntry = currentFile.endsWith('.ts');
 const cliEntry = path.join(path.dirname(currentFile), isTypeScriptEntry ? 'cli.ts' : 'cli.js');
+const MCP_TOOL_NAME = 'git_mark';
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -28,49 +29,71 @@ interface JsonRpcResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
-function tokenizeCommand(input: string): string[] {
-  const tokens: string[] = [];
-  let current = '';
-  let inSingle = false;
-  let inDouble = false;
-  let escaped = false;
+type McpAction = 'list' | 'search' | 'peek' | 'load';
 
-  for (const char of input.trim()) {
-    if (escaped) {
-      current += char;
-      escaped = false;
-      continue;
-    }
-    if (char === '\\' && !inSingle) {
-      escaped = true;
-      continue;
-    }
-    if (char === "'" && !inDouble) {
-      inSingle = !inSingle;
-      continue;
-    }
-    if (char === '"' && !inSingle) {
-      inDouble = !inDouble;
-      continue;
-    }
-    if (/\s/.test(char) && !inSingle && !inDouble) {
-      if (current.length > 0) {
-        tokens.push(current);
-        current = '';
-      }
-      continue;
-    }
-    current += char;
-  }
-
-  if (current.length > 0) {
-    tokens.push(current);
-  }
-  return tokens;
+interface ParsedMcpCall {
+  action: McpAction;
+  id?: string;
+  query?: string;
+  limit?: number;
+  offset?: number;
 }
 
-async function runCli(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const args = tokenizeCommand(command);
+function parseInteger(value: unknown, field: string, minimum: number): number | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isInteger(parsed) || parsed < minimum) {
+    throw new Error(`Invalid ${field}: expected an integer >= ${minimum}.`);
+  }
+  return parsed;
+}
+
+function parseString(value: unknown, field: string): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`Invalid ${field}: expected a non-empty string.`);
+  }
+  return trimmed;
+}
+
+function parseMcpCallArguments(raw: unknown): ParsedMcpCall {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('Invalid arguments: expected an object.');
+  }
+
+  const values = raw as Record<string, unknown>;
+  const action = parseString(values.action, 'action');
+  if (!action || !['list', 'search', 'peek', 'load'].includes(action)) {
+    throw new Error('Invalid action: expected list, search, peek, or load.');
+  }
+
+  if (action === 'list') {
+    return { action };
+  }
+
+  if (action === 'search') {
+    const query = parseString(values.query, 'query');
+    if (!query) {
+      throw new Error('Invalid query: expected a non-empty string.');
+    }
+    const limit = parseInteger(values.limit, 'limit', 1);
+    const offset = parseInteger(values.offset, 'offset', 0);
+    return { action, query, limit, offset };
+  }
+
+  const id = parseString(values.id, 'id');
+  if (!id) {
+    throw new Error('Invalid id: expected a non-empty string.');
+  }
+  return { action, id };
+}
+
+async function runCliArgs(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   try {
     const nodeArgs = isTypeScriptEntry ? ['--experimental-strip-types', cliEntry, ...args] : [cliEntry, ...args];
     const result = await execFileAsync(process.execPath, nodeArgs, {
@@ -90,6 +113,27 @@ async function runCli(command: string): Promise<{ stdout: string; stderr: string
       stderr: String(captured.stderr ?? (error instanceof Error ? error.message : String(error))),
       exitCode: typeof captured.code === 'number' ? captured.code : 1,
     };
+  }
+}
+
+async function runMcpAction(call: ParsedMcpCall): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  switch (call.action) {
+    case 'list':
+      return runCliArgs(['list']);
+    case 'search': {
+      const args = ['search', call.query ?? ''];
+      if (typeof call.limit === 'number') {
+        args.push('--limit', String(call.limit));
+      }
+      if (typeof call.offset === 'number') {
+        args.push('--offset', String(call.offset));
+      }
+      return runCliArgs(args);
+    }
+    case 'peek':
+      return runCliArgs(['peek', call.id ?? '']);
+    case 'load':
+      return runCliArgs(['load', call.id ?? '']);
   }
 }
 
@@ -129,18 +173,9 @@ async function handleRequest(request: JsonRpcRequest): Promise<JsonRpcResponse |
       result: {
         tools: [
           {
-            name: 'git_mark',
+            name: MCP_TOOL_NAME,
             description,
-            inputSchema: {
-              type: 'object',
-              properties: {
-                command: {
-                  type: 'string',
-                  description: 'CLI-style `gmk` command string.',
-                },
-              },
-              required: ['command'],
-            },
+            inputSchema: getMcpToolInputSchema(),
           },
         ],
       },
@@ -149,15 +184,27 @@ async function handleRequest(request: JsonRpcRequest): Promise<JsonRpcResponse |
 
   if (request.method === 'tools/call') {
     const toolName = String(request.params?.name ?? '');
-    if (toolName !== 'git_mark') {
+    if (toolName !== MCP_TOOL_NAME) {
       return {
         jsonrpc: '2.0',
         id: request.id ?? null,
         error: { code: -32601, message: `Unknown tool: ${toolName}` },
       };
     }
-    const command = String((request.params?.arguments as Record<string, unknown> | undefined)?.command ?? '');
-    const result = await runCli(command);
+    let call: ParsedMcpCall;
+    try {
+      call = parseMcpCallArguments(request.params?.arguments);
+    } catch (error) {
+      return {
+        jsonrpc: '2.0',
+        id: request.id ?? null,
+        error: {
+          code: -32602,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+    const result = await runMcpAction(call);
     const text = [result.stdout.trimEnd(), result.stderr.trimEnd()].filter(Boolean).join('\n');
     return {
       jsonrpc: '2.0',

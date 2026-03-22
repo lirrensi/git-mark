@@ -343,7 +343,7 @@ If your agent host supports MCP, use the shipped MCP server first. This is the e
 Why this is the best default:
 
 - no host-specific plugin work
-- one tool surface for `list`, `search`, `peek`, `load`, and maintenance commands
+- one tool surface for `list`, `search`, `peek`, and `load`
 - pinned resources show up in the MCP tool description automatically
 - the agent can search and load resources on demand instead of carrying everything in prompt text
 
@@ -356,10 +356,10 @@ Typical setup shape:
 Once connected, the host can call commands like:
 
 ```json
-{ "command": "list" }
-{ "command": "search design" }
-{ "command": "peek landing-design" }
-{ "command": "load landing-design" }
+{ "action": "list" }
+{ "action": "search", "query": "design" }
+{ "action": "peek", "id": "landing-design" }
+{ "action": "load", "id": "landing-design" }
 ```
 
 ### 2. Skill or system-prompt integration
@@ -411,12 +411,12 @@ Why build this deeper version: if you control the host, `git-mark` can become a 
 The integration story is intentionally minimal:
 
 - one MCP tool: `git_mark`
-- one input payload field: `command`
-- that field contains the same CLI-style string you would type after `gmk`
+- one structured input payload with an `action` field plus action-specific arguments
+- allowed actions: `list`, `search`, `peek`, and `load`
 
 So MCP is not a parallel command model. It is a transport wrapper around the CLI.
 
-That is the key design choice: one tool, one string payload, one shared behavior surface.
+That is the key design choice: one tool, one structured payload, one shared behavior surface.
 
 The MCP layer exists so an agent host can treat `git-mark` as another resource source, alongside its built-in skills or tools, without needing a custom resource protocol.
 
@@ -425,7 +425,7 @@ The MCP layer exists so an agent host can treat `git-mark` as another resource s
 - It keeps the MCP schema small.
 - It avoids duplicating command logic in a second interface.
 - It lets CLI improvements carry through to MCP automatically.
-- The `command` field acts as both instruction and payload transport.
+- The schema makes the valid actions visible to the tool host.
 
 ### MCP examples
 
@@ -444,16 +444,15 @@ node bin/git-mark-mcp.cjs
 The advertised tool is `git_mark` with an input shape like:
 
 ```json
-{ "command": "search design" }
+{ "action": "search", "query": "design" }
 ```
 
 More examples:
 
 ```json
-{ "command": "list" }
-{ "command": "peek design" }
-{ "command": "load design" }
-{ "command": "path design" }
+{ "action": "list" }
+{ "action": "peek", "id": "design" }
+{ "action": "load", "id": "design" }
 ```
 
 What comes back is text output from the CLI, with MCP marking the call as an error if the underlying CLI command exits non-zero.

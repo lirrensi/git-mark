@@ -23,6 +23,7 @@ const COMMAND_LINES = [
   'gmk unfreeze <id>',
 ];
 
+const MCP_ALLOWED_ACTIONS = ['list', 'search', 'peek', 'load'] as const;
 const MCP_PINNED_LIMIT = 15;
 const MCP_BLURB_LIMIT = 26;
 
@@ -45,7 +46,7 @@ export function getCliHelpText(): string {
 }
 
 function collapseWhitespace(value: string | undefined): string {
-  return (value ?? '').replace(/\s+/g, ' ').trim();
+  return (value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function getPinnedBlurb(record: PackageRecord): string {
@@ -60,8 +61,78 @@ function getPinnedBlurb(record: PackageRecord): string {
 }
 
 function formatPinnedLine(record: PackageRecord): string {
+  const safeId = collapseWhitespace(record.id) || 'package';
   const blurb = getPinnedBlurb(record);
-  return blurb ? `${record.id} | ${blurb}` : record.id;
+  const payload: { id: string; blurb?: string } = { id: safeId };
+  if (blurb) {
+    payload.blurb = blurb;
+  }
+  return JSON.stringify(payload);
+}
+
+export function getMcpToolInputSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    oneOf: [
+      {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list'],
+            description: 'Return the pinned package list.',
+          },
+        },
+        required: ['action'],
+        additionalProperties: false,
+      },
+      {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['search'],
+            description: 'Search discoverable packages by text query.',
+          },
+          query: {
+            type: 'string',
+            minLength: 1,
+            description: 'Search terms.',
+          },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            description: 'Optional maximum result count.',
+          },
+          offset: {
+            type: 'integer',
+            minimum: 0,
+            description: 'Optional result offset.',
+          },
+        },
+        required: ['action', 'query'],
+        additionalProperties: false,
+      },
+      {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['peek', 'load'],
+            description: 'Inspect or materialize a package by id.',
+          },
+          id: {
+            type: 'string',
+            minLength: 1,
+            description: 'Package id.',
+          },
+        },
+        required: ['action', 'id'],
+        additionalProperties: false,
+      },
+    ],
+  };
 }
 
 export function getMcpToolDescription(pinnedRecords: PackageRecord[]): string {
@@ -69,27 +140,27 @@ export function getMcpToolDescription(pinnedRecords: PackageRecord[]): string {
   const hiddenCount = Math.max(0, pinnedRecords.length - visibleRecords.length);
   const pinnedSection =
     visibleRecords.length > 0
-      ? ['Available resources:', ...visibleRecords.map(formatPinnedLine)].join('\n')
-      : 'Available resources: none yet.';
+      ? ['Pinned resources (sanitized data):', ...visibleRecords.map(formatPinnedLine)].join('\n')
+      : 'Pinned resources: none yet.';
 
   return [
     'git-mark bookmark manager for git-backed resources.',
     '',
-    'MCP tool: CLI-style wrapper; send one `command` string with what would follow `gmk`.',
+    'MCP tool: send one structured action object, not a free-form command string.',
+    `Allowed actions: ${MCP_ALLOWED_ACTIONS.join(', ')}.`,
+    'Read-only actions: list, search, peek.',
+    'load is allowed and may materialize a repo path.',
+    'Not exposed via MCP: remove, update, updateall, cleanup, sync, edit.',
     '',
     'Most used:',
-    'list',
-    'search <query>',
-    'load <id>',
-    '',
-    'Examples:',
-    '{ "command": "list" }',
-    '{ "command": "search design" }',
-    '{ "command": "load design" }',
-    '',
+    '{ "action": "list" }',
+    '{ "action": "search", "query": "design" }',
+    '{ "action": "peek", "id": "design" }',
+    '{ "action": "load", "id": "design" }',
     'What to expect:',
     'list -> newline package list with ids and short blurbs',
     'search -> matching packages with ids and short summaries',
+    'peek -> package materialization details and local path output',
     'load -> package materialization details and local path output',
     '',
     pinnedSection,

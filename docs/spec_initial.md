@@ -518,31 +518,32 @@ This addendum is intentionally pragmatic: it is not a native plugin architecture
 
 ### Goal
 
-Expose `git-mark` to current agents with minimal MCP overhead while still surfacing the pinned package set for the active session.
+Expose `git-mark` to current agents and older MCP-capable hosts with minimal overhead, without requiring host-side client modifications, while still surfacing the pinned package set for the active session.
 
 ### Recommended shape: one MCP tool
 
-Use a **single MCP tool** that wraps the existing CLI.
+Use a **single MCP tool** that wraps the existing CLI, but only exposes the read-only actions plus `load`. This is the compatibility path for hosts that need MCP instead of direct CLI integration.
 
 Example conceptual shape:
 
 - **tool name:** `git_mark`
 - **description:** generated from `gmk list`, plus short usage help
-- **input:** one command string, CLI-style
-- **behavior:** run `gmk <command>` and return stdout
+- **input:** a structured action object
+- **behavior:** run the selected `gmk` action and return stdout
 
 Example input:
 
 ```json
 {
-  "command": "search design templates"
+  "action": "search",
+  "query": "design templates"
 }
 ```
 
 The MCP server is therefore a thin adapter:
 
 ```text
-receive command string -> run gmk <command> -> return stdout
+receive structured action -> run selected gmk action -> return stdout
 ```
 
 This keeps CLI and MCP behavior aligned and avoids duplicating command logic in two places.
@@ -558,7 +559,12 @@ A single-tool, subcommand-style interface keeps integration small:
 - one input shape
 - no explosion of tiny wrappers like `list`, `search`, `load`, `peek`, `path`, `update`
 
-The command surface stays in the CLI where it belongs.
+The command surface stays in the CLI where it belongs. The MCP surface should stay intentionally smaller:
+
+- `list`
+- `search`
+- `peek`
+- `load`
 
 ### Tool description strategy
 
@@ -566,7 +572,7 @@ The MCP tool description should include:
 
 - a one-line explanation of what `git-mark` is
 - the currently pinned package set from `gmk list`
-- a short reminder of common commands such as `list`, `list-all`, `search`, `peek`, `load`, and `path`
+- a short reminder of supported MCP actions such as `list`, `search`, `peek`, and `load`
 
 It should **not** include resolved local paths for pinned packages.
 
@@ -579,13 +585,11 @@ Pinned resources available this session:
 - [rust-memory] Modern Rust memory principles
 - [design] Brand guidelines and templates
 
-Use commands like:
+Use actions like:
 - list
-- list-all
-- search <query>
-- peek <id>
-- load <id>
-- path <id>
+- search
+- peek
+- load
 ```
 
 This effectively injects a lightweight skills-style index into agents that already support MCP tools.

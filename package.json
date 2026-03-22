@@ -1,6 +1,6 @@
 {
     "name": "git-mark",
-    "version": "0.3.0",
+    "version": "0.5.0",
     "private": false,
     "description": "Bookmark manager for git-backed resources.",
     "type": "module",

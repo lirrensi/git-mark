@@ -22,7 +22,7 @@ The product exists for people who regularly reuse prompts, skills, docs, templat
 - Materialize a resource on demand and return a usable local path
 - Keep stable managed clones for kept resources and disposable temp clones for temp resources
 - Freeze a record to a specific commit and skip it during bulk updates
-- Expose the same CLI surface through a thin single-tool MCP wrapper
+- Expose a read-only CLI subset, plus `load`, through a thin single-tool MCP wrapper
 
 ## Main User Flows
 
@@ -48,7 +48,7 @@ The user can ask for the current path with `gmk path <id>`, refresh materialized
 
 ### Use from an MCP host
 
-An MCP host can call one `git_mark` tool that accepts a single CLI-style command string. The tool description includes a compact view of the currently pinned resources so agent workflows can discover likely-useful bookmarks without a custom integration layer.
+An MCP host can call one `git_mark` tool that accepts a structured action payload. The tool description includes a compact, sanitized view of the currently pinned resources so agent workflows can discover likely-useful bookmarks without a custom integration layer.
 
 ## System Shape
 

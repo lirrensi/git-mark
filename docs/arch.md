@@ -2,13 +2,13 @@
 
 ## Overview
 
-This repository implements `git-mark` as a small Node.js 24+ TypeScript CLI with a thin MCP adapter. The implementation is intentionally local-first: it reads a user-owned TOML index under `~/.gitmark`, maintains derived runtime state under the same storage root, shells out to the system `git` executable for remote operations, and returns filesystem paths to callers.
+This repository implements `git-mark` as a small Node.js 24+ TypeScript CLI with a thin MCP adapter. The implementation is intentionally local-first: it reads a user-owned TOML index under `~/.gitmark`, maintains derived runtime state under the same storage root, shells out to the system `git` executable for remote operations, and returns filesystem paths to callers. The MCP layer is not a general command runner; it exposes a schema-validated action subset for `list`, `search`, `peek`, and `load`.
 
 The architecture is simple enough to keep in a single file. Most behavior lives in a shared service module used by both the CLI and the MCP wrapper.
 
 ## Scope Boundary
 
-**Owns**: CLI parsing, TOML index/config IO, search ranking, materialization state, lock coordination, hook dispatch, git command orchestration, MCP delegation to the CLI
+**Owns**: CLI parsing, TOML index/config IO, search ranking, materialization state, lock coordination, hook dispatch, git command orchestration, structured MCP delegation to the CLI
 
 **Does not own**: git server behavior, remote repository contents, editor behavior, MCP host lifecycle beyond the JSON-RPC server contract
 
@@ -125,9 +125,11 @@ Under the effective storage root:
 
 1. `src/mcp.ts` boots the same bootstrap files as the CLI
 2. `tools/list` builds one tool description from currently pinned records via `src/help.ts`
-3. `tools/call` tokenizes the provided command string
+3. `tools/call` accepts a structured action payload and validates it before execution
 4. The server spawns `node --experimental-strip-types src/cli.ts ...args`
-5. Stdout and stderr are merged into a text result and flagged as error when exit status is non-zero
+5. The MCP surface exposes read-only discovery plus `load`; mutating commands are not surfaced
+6. Stdout and stderr are merged into a text result and flagged as error when exit status is non-zero
+7. Arbitrary shell execution is intentionally out of scope for MCP; if a deployment needs that capability, it should be exposed separately through a permissioned shell tool rather than by widening the MCP schema
 
 ### Search flow
 
