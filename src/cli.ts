@@ -21,6 +21,7 @@ import {
     listRecords,
     loadRecord,
     peekRecord,
+    persistRecordArtifacts,
     pinRecord,
     reconcileRuntimeState,
     removeRecord,
@@ -388,6 +389,9 @@ async function executeCommand(
                     id: addTarget.id,
                     ...recordInput,
                 });
+            if (inspection.artifacts) {
+                await persistRecordArtifacts(context, record, inspection.artifacts);
+            }
             console.log(record.id);
             await logger.info('add', { id: record.id, remote: record.remotes[0] });
             return;

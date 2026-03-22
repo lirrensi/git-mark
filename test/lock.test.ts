@@ -11,7 +11,7 @@ function makeContext(root: string): CommandContext {
   return {
     paths: {
       home: root,
-      indexPath: path.join(root, '.gitmarks.toml'),
+      indexPath: path.join(root, '.gitmark', 'index.toml'),
       configPath: path.join(root, '.gitmark', 'config.toml'),
       logPath: path.join(root, 'runtime', 'history.log'),
       statePath: path.join(root, 'runtime', 'state.json'),

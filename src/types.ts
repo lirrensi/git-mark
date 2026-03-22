@@ -52,6 +52,7 @@ export interface RepoState {
   defaultBranch: string;
   lastCommit: string;
   updatedAt: string;
+  artifacts?: RepoArtifacts;
 }
 
 export interface TempState {
@@ -61,6 +62,16 @@ export interface TempState {
   defaultBranch: string;
   lastAccessedAt: string;
   materializedAt: string;
+  artifacts?: RepoArtifacts;
+}
+
+export interface RepoArtifacts {
+  readmeText?: string;
+  readmeSource?: string;
+  preview?: string[];
+  skills?: Record<string, string>;
+  collectedAt?: string;
+  collectedCommit?: string;
 }
 
 export interface ToolState {
@@ -93,6 +104,7 @@ export interface AddInspection {
   subpath?: string;
   preview: string[];
   readmeExcerpt?: string;
+  artifacts?: RepoArtifacts;
 }
 
 export interface PackageSourceIdentity {

@@ -4,7 +4,7 @@
 
 `git-mark` is a bookmark manager for git-backed resources. It lets a user keep a portable personal catalog of useful repositories or repository subpaths, search that catalog locally, inspect entries before use, and materialize only the resources they need onto the local machine.
 
-The product exists for people who regularly reuse prompts, skills, docs, templates, scripts, reference repos, or other git-hosted materials but do not want a heavyweight registry, package publishing workflow, or dependency manager. The durable truth is the bookmark index in `~/.gitmarks.toml`; the local clones, temp directories, and runtime state are rebuildable cache-like derivatives.
+The product exists for people who regularly reuse prompts, skills, docs, templates, scripts, reference repos, or other git-hosted materials but do not want a heavyweight registry, package publishing workflow, or dependency manager. The durable truth is the bookmark index in `~/.gitmark/index.toml`; the local clones, temp directories, and runtime state are rebuildable cache-like derivatives.
 
 ## Target Users
 
@@ -17,7 +17,7 @@ The product exists for people who regularly reuse prompts, skills, docs, templat
 - Track resources as bookmark records in a TOML index, using a stable local `id`
 - Point a record at either a whole repository or a specific subpath within one repository
 - Distinguish surfaced favorites (`pinned`) from storage policy (`kept`)
-- Search bookmarks locally with lexical ranking across ids and metadata
+- Search bookmarks locally across ids, metadata, and cached repo artifacts such as README text, visible-tree previews, and discovered skill metadata from Agent Skills-standard skill directories
 - Inspect a resource with compact metadata, file preview, and README excerpt before loading it
 - Materialize a resource on demand and return a usable local path
 - Keep stable managed clones for kept resources and disposable temp clones for temp resources
@@ -28,7 +28,7 @@ The product exists for people who regularly reuse prompts, skills, docs, templat
 
 ### Build a bookmark catalog
 
-The user adds a git remote, optionally with a subpath. `git-mark` inspects the source, suggests metadata, and writes a package record to `~/.gitmarks.toml`. In interactive mode it asks for summary, description, resources, default surfacing, storage mode, and search visibility.
+The user adds a git remote, optionally with a subpath. `git-mark` inspects the source, suggests metadata, and writes a package record to `~/.gitmark/index.toml`. In interactive mode it asks for summary, description, resources, default surfacing, storage mode, and search visibility.
 
 ### Browse what is already known
 
@@ -52,9 +52,9 @@ An MCP host can call one `git_mark` tool that accepts a single CLI-style command
 
 ## System Shape
 
-- Canonical bookmark truth lives in `~/.gitmarks.toml`
+- Canonical bookmark truth lives in `~/.gitmark/index.toml`
 - Runtime behavior is configured through `~/.gitmark/config.toml`
-- Managed local data lives under the runtime storage root, including kept repos, temp materializations, state, logs, and the writer lock
+- Managed local data lives under `~/.gitmark`, including the canonical index, kept repos, temp materializations, state, logs, and the writer lock
 - The CLI is the primary interface
 - A thin MCP wrapper delegates to the CLI instead of re-implementing command logic
 - Git is the external transport and storage protocol for all bookmarked resources
@@ -63,8 +63,9 @@ An MCP host can call one `git_mark` tool that accepts a single CLI-style command
 
 - TOML-first truth over service-managed state
 - Git-backed resources without requiring author-side manifests
-- Local-first discovery with no embedding service or remote search dependency
+- Local-first discovery with no embedding service, database requirement, or remote search dependency
 - Rebuildable runtime state: indexes and config are user truth; materializations are disposable derivatives
+- Derived repo artifacts are cached locally to improve inspection and search without changing the canonical text-first source of truth
 - Convenience entry points rather than strong isolation boundaries when a subpath is selected
 
 ## Non-Goals

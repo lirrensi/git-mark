@@ -63,9 +63,9 @@ The key words `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`, and `MAY` in this docu
 
 | Layer | Location | Status |
 |---|---|---|
-| Package index | `~/.gitmarks.toml` | Canonical user-managed truth |
+| Package index | `~/.gitmark/index.toml` | Canonical user-managed truth |
 | Runtime config | `~/.gitmark/config.toml` | Canonical user-managed runtime policy |
-| Runtime state | `<storage root>/state.json` | Derived, disposable tool state |
+| Runtime state | `<storage root>/state.json` | Derived, disposable tool state including materialization metadata and cached repo artifacts |
 | Logs | `<storage root>/history.log` | Derived operational log |
 | Kept repos | `<storage root>/repos/<repo-key>` | Derived materialization |
 | Temp repos | `<temp root>/<sanitized-id>-<timestamp>` | Derived materialization |
@@ -141,6 +141,7 @@ A conforming implementation:
 - If the exact same remote plus subpath already exists, non-interactive `add` MUST fail clearly.
 - Interactive duplicate handling MUST offer replace, keep-both-under-another-id, or cancel.
 - Successful `add` MUST write the updated index and print the resulting id.
+- Successful `add` SHOULD persist derived artifacts collected during source inspection.
 
 ### `list`
 
@@ -159,10 +160,14 @@ A conforming implementation:
 - `search` MUST require a non-empty query to return results; empty queries return no matches.
 - Default pagination MUST be `--limit 10 --offset 0`.
 - Search MUST exclude records with `discoverable = false`.
-- Search MUST index `id`, `summary`, `description`, and `resources`.
+- Search MUST use package metadata from the canonical index and MAY also use available derived repo artifacts from runtime state.
+- Search MUST index `id`, `summary`, `description`, `resources`, and `subpath`.
+- When derived artifacts are available, search MUST also index cached README text and discovered skill metadata.
 - Search MUST be case-insensitive and perform lightweight normalization over punctuation, path separators, dashes, and underscores.
 - Search SHOULD support exact token matches, prefix completion, and light typo tolerance.
-- Exact and prefix `id` matches MUST outrank broader descriptive matches.
+- Search MUST remain local-only and MUST NOT clone, fetch, or otherwise materialize repositories as part of the `search` command.
+- Exact and prefix `id` matches MUST outrank all broader descriptive, skill, and README matches.
+- `summary` and `description` SHOULD outrank `resources`, `subpath`, discovered skill metadata, and README body text.
 - Ties MUST break by `id` ascending.
 
 ### `peek`
@@ -180,6 +185,8 @@ A conforming implementation:
 - `load` MUST run `preLoad` before materialization work.
 - For kept packages, `load` MUST materialize or reuse a stable repo path under the managed repos root.
 - For temp packages, `load` MUST materialize or reuse a temp repo path under the temp root.
+- `load` MUST NOT refresh cached derived artifacts when reusing an already materialized package with existing artifacts.
+- `load` SHOULD collect derived artifacts when materializing a package for the first time or when artifacts are missing.
 - If `subpath` is present, `load` MUST return the visible subpath rather than the repo root.
 - `load` MUST run `preExpose` after materialization and before returning a path.
 - `load` MUST run `postLoad` after successful exposure handling.
@@ -199,12 +206,14 @@ A conforming implementation:
 - `update` MUST run `preUpdate` before fetching and `postUpdate` after success.
 - `update` MUST fetch from `origin` and reset the local clone hard to `origin/<default-branch>`.
 - Update behavior for tool-managed clones is intentionally destructive; local edits inside those clones are not preserved.
+- `update` MUST refresh cached derived artifacts after a successful update.
 - After updating, the visible path MUST still be returned.
 
 ### `updateall`
 
 - `updateall` MUST process every non-frozen package.
 - `updateall` MUST skip frozen packages silently in normal operation.
+- `updateall` MUST refresh cached derived artifacts for every updated package.
 - `updateall` MUST print the number of updated packages.
 
 ### `pin` and `unpin`
@@ -241,6 +250,7 @@ A conforming implementation:
 ### `sync`
 
 - `sync` MUST reconcile runtime drift and then materialize every kept package.
+- `sync` MUST refresh cached derived artifacts for each kept package it materializes.
 - `sync` MUST NOT materialize temp-only packages.
 
 ### `edit`
@@ -273,6 +283,16 @@ A conforming implementation:
 Each kept repo state MUST include path, selected remote, default branch, last commit, and update timestamp.
 
 Each temp state MUST include path, repo key, selected remote, default branch, materialization time, and last access time.
+
+Derived artifacts MAY be stored alongside kept repo and temp state entries.
+
+When present, derived artifacts:
+
+- MUST be treated as disposable cache-like state
+- MUST preserve raw README text and cap it at 16384 characters
+- MUST store preview data for the visible path rather than repo paths outside the selected subpath
+- MUST represent discovered skills as a name-to-description map
+- MUST discover skills by following the Agent Skills specification directory shape: a skill directory that contains a `SKILL.md` file with standard frontmatter and Markdown body
 
 ### Temp cleanup rules
 
@@ -307,7 +327,7 @@ If a configured hook module cannot be loaded, the invoking command MUST fail cle
 
 ## Error Handling and Edge Cases
 
-- Malformed `~/.gitmarks.toml` MUST fail loudly with line context.
+- Malformed `~/.gitmark/index.toml` MUST fail loudly with line context.
 - Malformed `config.toml` MUST fail loudly with line context.
 - Malformed `state.json` MUST be preserved as `state.broken-*.json` and treated as empty runtime state.
 - Missing package ids MUST return a not-found error.
@@ -335,3 +355,4 @@ If a configured hook module cannot be loaded, the invoking command MUST fail cle
 
 - `docs/product.md`
 - `docs/spec_initial.md` (historical artifact, not canonical)
+- Agent Skills specification: `https://agentskills.io/specification`

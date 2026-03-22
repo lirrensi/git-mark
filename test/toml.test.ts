@@ -68,7 +68,8 @@ test('malformed config.toml fails loudly after the file exists', async () => {
 
 test('malformed package index fails loudly with line context', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gmk-index-invalid-'));
-  const indexPath = path.join(root, '.gitmarks.toml');
+  const indexPath = path.join(root, '.gitmark', 'index.toml');
+  await fs.mkdir(path.dirname(indexPath), { recursive: true });
   await fs.writeFile(indexPath, '[[package]]\nid = "design"\n', 'utf8');
 
   await assert.rejects(

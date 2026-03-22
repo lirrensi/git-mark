@@ -12,6 +12,7 @@ import {
   resetToRemoteBranch,
   runGit,
 } from './git.ts';
+import { collectRepoArtifacts, previewVisiblePath } from './artifacts.ts';
 import { expandHome } from './env.ts';
 import { GitMarkError } from './errors.ts';
 import { ensureDir, pathExists, readTextIfExists, removeIfExists, writeTextAtomic } from './fs.ts';
@@ -32,6 +33,7 @@ import type {
   TempState,
   ToolState,
   RuntimeConfig,
+  RepoArtifacts,
 } from './types.ts';
 import { parsePackageIndex, stringifyPackageIndex } from './toml.ts';
 import { countSearchPackages, searchPackages } from './search.ts';
@@ -185,6 +187,9 @@ export async function cleanupTempMaterializations(context: CommandContext): Prom
   let changed = false;
 
   for (const [id, temp] of Object.entries(state.temps)) {
+    if (isInspectionOnlyArtifactEntry(temp.path, temp.artifacts)) {
+      continue;
+    }
     const age = now - new Date(temp.lastAccessedAt).getTime();
     const missing = !(await pathExists(temp.path));
     if (missing || Number.isNaN(age) || age > ONE_DAY_MS) {
@@ -259,6 +264,10 @@ async function listDirectoryNames(targetPath: string): Promise<string[]> {
   return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
 }
 
+function isInspectionOnlyArtifactEntry(pathValue: string, artifacts: RepoArtifacts | undefined): boolean {
+  return pathValue === '' && artifacts !== undefined;
+}
+
 interface RuntimeDriftSnapshot {
   records: PackageRecord[];
   state: ToolState;
@@ -280,7 +289,9 @@ async function collectRuntimeDriftSnapshot(context: CommandContext): Promise<Run
 
   const orphanTempStateEntries: Array<{ id: string; path: string; missingPath: boolean }> = [];
   for (const [id, temp] of Object.entries(state.temps)) {
-    const missingPath = !(await pathExists(temp.path));
+    const missingPath = isInspectionOnlyArtifactEntry(temp.path, temp.artifacts)
+      ? false
+      : !(await pathExists(temp.path));
     if (!expectedPackageIds.has(id) || missingPath) {
       orphanTempStateEntries.push({ id, path: temp.path, missingPath });
     }
@@ -288,7 +299,9 @@ async function collectRuntimeDriftSnapshot(context: CommandContext): Promise<Run
 
   const orphanRepoStateEntries: Array<{ repoKey: string; path: string; missingPath: boolean }> = [];
   for (const [repoKey, repo] of Object.entries(state.repos)) {
-    const missingPath = !(await pathExists(repo.path));
+    const missingPath = isInspectionOnlyArtifactEntry(repo.path, repo.artifacts)
+      ? false
+      : !(await pathExists(repo.path));
     if (!expectedKeptRepoKeys.has(repoKey) || missingPath) {
       orphanRepoStateEntries.push({ repoKey, path: repo.path, missingPath });
     }
@@ -298,7 +311,14 @@ async function collectRuntimeDriftSnapshot(context: CommandContext): Promise<Run
   for (const record of keptRecords) {
     const repoKey = repoKeyFor(record);
     const repoState = state.repos[repoKey];
-    if (!repoState || !(await pathExists(repoState.path))) {
+    if (!repoState) {
+      missingKeptMaterializations.push({ id: record.id, repoKey });
+      continue;
+    }
+    if (isInspectionOnlyArtifactEntry(repoState.path, repoState.artifacts)) {
+      continue;
+    }
+    if (!(await pathExists(repoState.path))) {
       missingKeptMaterializations.push({ id: record.id, repoKey });
     }
   }
@@ -306,10 +326,16 @@ async function collectRuntimeDriftSnapshot(context: CommandContext): Promise<Run
   const liveTempPaths = new Set(
     Object.values(state.temps)
       .map((temp) => temp.path)
-      .filter((tempPath) => path.dirname(tempPath) === context.paths.tempRoot),
+      .filter((tempPath) => tempPath && path.dirname(tempPath) === context.paths.tempRoot),
   );
   const liveRepoDirectories = new Set<string>();
   for (const [repoKey, repo] of Object.entries(state.repos)) {
+    if (!repo.path) {
+      if (expectedKeptRepoKeys.has(repoKey)) {
+        liveRepoDirectories.add(repoKey);
+      }
+      continue;
+    }
     if (path.dirname(repo.path) === context.paths.reposRoot) {
       liveRepoDirectories.add(path.basename(repo.path));
       continue;
@@ -593,9 +619,10 @@ export async function searchRecords(
   offset = 0,
 ): Promise<{ hits: SearchHit[]; total: number }> {
   const records = await loadIndexFile(context.paths.indexPath);
+  const state = await loadState(context.paths.statePath);
   return {
-    hits: searchPackages(records, query, limit, offset),
-    total: countSearchPackages(records, query),
+    hits: searchPackages(records, state, limit, offset, query),
+    total: countSearchPackages(records, state, query),
   };
 }
 
@@ -607,6 +634,14 @@ export async function peekRecord(
   const record = records.find((entry) => entry.id === id);
   if (!record) {
     throw new GitMarkError('NOT_FOUND', `Package ${id} was not found.`);
+  }
+  const cachedArtifacts = await loadRecordArtifacts(context, record);
+  if (cachedArtifacts?.preview?.length || cachedArtifacts?.readmeText) {
+    return {
+      record,
+      preview: cachedArtifacts.preview ?? [],
+      readme: readmeExcerptFromText(cachedArtifacts.readmeText),
+    };
   }
   const inspection = await materializeForInspection(context, record);
   const repoPath = inspection.repoPath;
@@ -639,18 +674,54 @@ export async function inspectAddSource(context: CommandContext, source: string):
   try {
     await ensureGitAccessible();
     const clone = await resolveCloneTarget(context, record, scratchPath, false);
-    const preview = await previewVisiblePath(clone.repoPath, parsed.subpath);
-    const readmeExcerpt = await readReadmeExcerpt(record, clone.repoPath);
+    const artifacts = await collectRepoArtifacts(clone.repoPath, record, clone.commit);
+    const preview = artifacts.preview ?? [];
+    const readmeExcerpt = readmeExcerptFromText(artifacts.readmeText);
     return {
       source,
       remote: parsed.remotes[0],
       subpath: parsed.subpath,
       preview,
       readmeExcerpt,
+      artifacts,
     };
   } finally {
     await removeIfExists(scratchPath);
   }
+}
+
+export async function persistRecordArtifacts(
+  context: CommandContext,
+  record: PackageRecord,
+  artifacts: RepoArtifacts,
+): Promise<void> {
+  const state = await loadState(context.paths.statePath);
+  if (record.kept) {
+    const repoKey = repoKeyFor(record);
+    const existing = state.repos[repoKey];
+    state.repos[repoKey] = {
+      ...existing,
+      path: existing?.path ?? '',
+      selectedRemote: existing?.selectedRemote ?? '',
+      defaultBranch: existing?.defaultBranch ?? '',
+      lastCommit: existing?.lastCommit ?? '',
+      updatedAt: existing?.updatedAt ?? '',
+      artifacts,
+    };
+  } else {
+    const existing = state.temps[record.id];
+    state.temps[record.id] = {
+      ...existing,
+      path: existing?.path ?? '',
+      repoKey: existing?.repoKey ?? repoKeyFor(record),
+      selectedRemote: existing?.selectedRemote ?? '',
+      defaultBranch: existing?.defaultBranch ?? '',
+      materializedAt: existing?.materializedAt ?? '',
+      lastAccessedAt: existing?.lastAccessedAt ?? '',
+      artifacts,
+    };
+  }
+  await saveState(context.paths.statePath, state);
 }
 
 async function materializeForInspection(
@@ -677,6 +748,32 @@ async function materializeForInspection(
   return { repoPath: clone.repoPath, transient: true };
 }
 
+async function refreshArtifactsForRecord(
+  context: CommandContext,
+  record: PackageRecord,
+  repoPath: string,
+  state: ToolState,
+): Promise<ToolState> {
+  const commit = await currentCommit(repoPath, getRuntimeGitTimeoutMs(context.config));
+  const artifacts = await collectRepoArtifacts(repoPath, record, commit);
+  artifacts.collectedAt = new Date().toISOString();
+  artifacts.collectedCommit = commit;
+  if (record.kept) {
+    const repoKey = repoKeyFor(record);
+    const existing = state.repos[repoKey];
+    state.repos[repoKey] = { ...existing, artifacts } as RepoState;
+  } else {
+    const existing = state.temps[record.id];
+    state.temps[record.id] = { ...existing, artifacts } as TempState;
+  }
+  return state;
+}
+
+async function loadRecordArtifacts(context: CommandContext, record: PackageRecord): Promise<RepoArtifacts | undefined> {
+  const state = await loadState(context.paths.statePath);
+  return record.kept ? state.repos[repoKeyFor(record)]?.artifacts : state.temps[record.id]?.artifacts;
+}
+
 export async function loadRecord(context: CommandContext, id: string): Promise<string> {
   await ensureGitAccessible();
   const gitTimeoutMs = getRuntimeGitTimeoutMs(context.config);
@@ -690,6 +787,8 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
   const state = await loadState(context.paths.statePath);
   if (record.kept) {
     const repoKey = repoKeyFor(record);
+    const existingRepo = state.repos[repoKey];
+    const reusedWithArtifacts = Boolean(existingRepo?.artifacts && existingRepo.path && (await pathExists(existingRepo.path)));
     const repoPath = path.join(context.paths.reposRoot, repoKey);
     const clone = await resolveCloneTarget(context, record, repoPath, true);
     if (record.frozen && record.commit) {
@@ -704,7 +803,11 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
       defaultBranch: clone.defaultBranch,
       lastCommit: await currentCommit(clone.repoPath, gitTimeoutMs),
       updatedAt: new Date().toISOString(),
+      artifacts: existingRepo?.artifacts,
     };
+    if (!reusedWithArtifacts) {
+      await refreshArtifactsForRecord(context, record, clone.repoPath, state);
+    }
     await saveState(context.paths.statePath, state);
     await runHooks(context, 'preExpose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
     await runHooks(context, 'postLoad', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
@@ -716,6 +819,9 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
     existingTemp.lastAccessedAt = new Date().toISOString();
     if (record.frozen && record.commit) {
       await checkoutCommit(existingTemp.path, record.commit, gitTimeoutMs);
+    }
+    if (!existingTemp.artifacts) {
+      await refreshArtifactsForRecord(context, record, existingTemp.path, state);
     }
     await saveState(context.paths.statePath, state);
     await runHooks(context, 'preExpose', record, existingTemp.path, existingTemp.selectedRemote, existingTemp.defaultBranch);
@@ -736,6 +842,7 @@ export async function loadRecord(context: CommandContext, id: string): Promise<s
     materializedAt: new Date().toISOString(),
     lastAccessedAt: new Date().toISOString(),
   };
+  await refreshArtifactsForRecord(context, record, clone.repoPath, state);
   await saveState(context.paths.statePath, state);
   await runHooks(context, 'preExpose', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
   await runHooks(context, 'postLoad', record, clone.repoPath, clone.selectedRemote, clone.defaultBranch);
@@ -789,13 +896,15 @@ export async function updateRecord(context: CommandContext, id: string, force = 
     await checkoutCommit(repoPath, record.commit, gitTimeoutMs);
   }
   const commit = await currentCommit(repoPath, gitTimeoutMs);
+  await refreshArtifactsForRecord(context, record, repoPath, state);
   if (record.kept) {
     state.repos[repoKey] = {
       path: repoPath,
       selectedRemote,
       defaultBranch,
-      lastCommit: commit,
+      lastCommit: state.repos[repoKey]?.artifacts?.collectedCommit ?? commit,
       updatedAt: new Date().toISOString(),
+      artifacts: state.repos[repoKey]?.artifacts,
     };
   } else {
     const tempState = repoState as TempState | undefined;
@@ -806,6 +915,7 @@ export async function updateRecord(context: CommandContext, id: string, force = 
       defaultBranch,
       materializedAt: tempState?.materializedAt ?? new Date().toISOString(),
       lastAccessedAt: new Date().toISOString(),
+      artifacts: state.temps[record.id]?.artifacts,
     };
   }
   await saveState(context.paths.statePath, state);
@@ -963,6 +1073,12 @@ export async function syncKeptRecords(context: CommandContext): Promise<SyncReco
   const keptRecords = records.filter((record) => record.kept);
   for (const record of keptRecords) {
     await loadRecord(context, record.id);
+    const state = await loadState(context.paths.statePath);
+    const repoState = state.repos[repoKeyFor(record)];
+    if (!repoState) {
+      continue;
+    }
+    await saveState(context.paths.statePath, await refreshArtifactsForRecord(context, record, repoState.path, state));
   }
   return {
     keptPackagesProcessed: keptRecords.length,
@@ -1044,39 +1160,6 @@ export async function updateAllRecords(context: CommandContext): Promise<number>
   return count;
 }
 
-export async function previewVisiblePath(repoPath: string, subpath?: string): Promise<string[]> {
-  const base = subpath ? path.join(repoPath, subpath) : repoPath;
-  if (!(await pathExists(base))) {
-    return [];
-  }
-  const entries = await listDirectoryPreview(base, 2, DEFAULT_PREVIEW_LIMIT);
-  return entries;
-}
-
-async function listDirectoryPreview(targetPath: string, depth: number, limit: number): Promise<string[]> {
-  const entries: string[] = [];
-
-  async function walk(currentPath: string, currentDepth: number, prefix: string): Promise<void> {
-    if (entries.length >= limit || currentDepth < 0) {
-      return;
-    }
-    const items = await fs.readdir(currentPath, { withFileTypes: true });
-    for (const item of items) {
-      if (entries.length >= limit) {
-        break;
-      }
-      const relative = prefix ? `${prefix}/${item.name}` : item.name;
-      entries.push(item.isDirectory() ? `${relative}/` : relative);
-      if (item.isDirectory() && currentDepth > 0) {
-        await walk(path.join(currentPath, item.name), currentDepth - 1, relative);
-      }
-    }
-  }
-
-  await walk(targetPath, depth, '');
-  return entries;
-}
-
 async function readReadmeExcerpt(record: PackageRecord, repoPath: string): Promise<string | undefined> {
   const candidates = [path.join(repoPath, 'README.md'), path.join(repoPath, 'README'), path.join(repoPath, 'readme.md')];
   if (record.subpath) {
@@ -1090,11 +1173,17 @@ async function readReadmeExcerpt(record: PackageRecord, repoPath: string): Promi
     if (!(await pathExists(candidate))) {
       continue;
     }
-    const text = await fs.readFile(candidate, 'utf8');
-    const excerpt = text.slice(0, DEFAULT_README_EXCERPT_LENGTH).replace(/\s+/g, ' ').trim();
-    return excerpt.length > 0 ? excerpt : undefined;
+    return readmeExcerptFromText(await fs.readFile(candidate, 'utf8'));
   }
   return undefined;
+}
+
+function readmeExcerptFromText(text?: string): string | undefined {
+  if (!text) {
+    return undefined;
+  }
+  const excerpt = text.slice(0, DEFAULT_README_EXCERPT_LENGTH).replace(/\s+/g, ' ').trim();
+  return excerpt.length > 0 ? excerpt : undefined;
 }
 
 export async function runHooks(

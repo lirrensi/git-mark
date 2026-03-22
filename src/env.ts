@@ -21,7 +21,7 @@ export function getBootstrapPaths(): BootstrapPaths {
   const home = getHomeDir();
   return {
     home,
-    indexPath: expandHome('~/.gitmarks.toml'),
+    indexPath: expandHome('~/.gitmark/index.toml'),
     configPath: path.join(expandHome('~/.gitmark'), 'config.toml'),
   };
 }

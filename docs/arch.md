@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository implements `git-mark` as a small Node.js 24+ TypeScript CLI with a thin MCP adapter. The implementation is intentionally local-first: it reads a user-owned TOML index, maintains derived runtime state under a configurable storage root, shells out to the system `git` executable for remote operations, and returns filesystem paths to callers.
+This repository implements `git-mark` as a small Node.js 24+ TypeScript CLI with a thin MCP adapter. The implementation is intentionally local-first: it reads a user-owned TOML index under `~/.gitmark`, maintains derived runtime state under the same storage root, shells out to the system `git` executable for remote operations, and returns filesystem paths to callers.
 
 The architecture is simple enough to keep in a single file. Most behavior lives in a shared service module used by both the CLI and the MCP wrapper.
 
@@ -30,7 +30,7 @@ The architecture is simple enough to keep in a single file. Most behavior lives 
 | `src/index.ts` | Primary domain logic for records, materialization, updates, cleanup, hooks, and drift reconciliation |
 | `src/git.ts` | Child-process wrapper around git commands, timeouts, and LFS environment handling |
 | `src/lock.ts` | Filesystem-backed single-writer lock with heartbeat and stale-lock recovery |
-| `src/search.ts` | Local lexical ranking using weighted BM25-style scoring plus prefix/fuzzy expansion |
+| `src/search.ts` | Local in-memory search over index records and cached repo artifacts, built on MiniSearch with explicit field boosting and id-priority rules |
 | `src/toml.ts` | Minimal custom parser/stringifier for package index and runtime config |
 
 ### Supporting modules
@@ -50,7 +50,7 @@ The architecture is simple enough to keep in a single file. Most behavior lives 
 
 ### Package index
 
-- Location: `~/.gitmarks.toml`
+- Location: `~/.gitmark/index.toml`
 - Format: repeated `[[package]]` TOML records
 - Ownership: user-managed canonical data
 
@@ -67,7 +67,7 @@ Under the effective storage root:
 | Path | Purpose |
 |---|---|
 | `history.log` | Operational history and command-failure logging |
-| `state.json` | Derived materialization map for kept repos and temp repos |
+| `state.json` | Derived materialization map plus cached repo artifacts such as README text, visible-tree preview, and discovered skill metadata |
 | `.write.lock/` | Single-writer coordination metadata |
 | `repos/` | Stable kept materializations keyed by repo hash |
 | temp root | Temp materializations keyed by sanitized id plus timestamp |
@@ -77,6 +77,13 @@ Under the effective storage root:
 - Package identity is the record `id`
 - Kept repo storage identity is `repoKeyFor(record)`, a SHA-256 digest over the sorted remote list, truncated to 24 hex chars
 - Temp storage identity is package-id based and timestamped, so temp materializations are per-package and ephemeral
+
+### Search artifact cache
+
+- `state.json` remains disposable derived state, but also stores the last collected metadata artifacts for materialized or inspected repos
+- Cached artifacts are stored alongside kept repo and temp repo state rather than in a separate database or cache file
+- README text is stored raw and truncated to 16384 characters
+- Discovered skills follow the Agent Skills specification and are cached as a name-to-description map extracted from matching `SKILL.md` files
 
 ## Relationships and Flow
 
@@ -122,6 +129,21 @@ Under the effective storage root:
 4. The server spawns `node --experimental-strip-types src/cli.ts ...args`
 5. Stdout and stderr are merged into a text result and flagged as error when exit status is non-zero
 
+### Search flow
+
+1. Load canonical records from `~/.gitmark/index.toml`
+2. Load derived artifacts from `state.json`
+3. Build an in-memory MiniSearch index from record metadata plus cached artifacts
+4. Apply explicit boosts so exact and prefix `id` matches outrank broader text matches
+5. Return ranked package hits without network or git operations
+
+### Artifact collection flow
+
+1. During `add` inspection, extract README text, visible-path preview, and discovered skill metadata from Agent Skills-standard skill directories
+2. Persist those artifacts into `state.json`
+3. On `update`, `updateall`, and `sync`, refresh artifacts after repo content changes
+4. On `load`, reuse existing artifacts when present; only collect artifacts when materialization is new or artifacts are missing
+
 ## Dependencies
 
 ### Runtime dependencies
@@ -136,17 +158,18 @@ Under the effective storage root:
 
 - `src/cli.ts` depends on almost every other internal module and is the orchestration root
 - `src/mcp.ts` depends on bootstrap helpers, index loading, and help-text generation, but delegates command execution back to the CLI
-- `src/index.ts` is the main domain layer and depends on filesystem, git, search, TOML, env, and lock inspection helpers
+- `src/index.ts` is the main domain layer and depends on filesystem, git, TOML, env, lock inspection helpers, and artifact extraction helpers
+- `src/search.ts` depends on MiniSearch and builds a transient in-memory index from canonical records plus cached runtime artifacts
 
 ## Contracts / Invariants
 
 | Invariant | Description |
 |---|---|
-| Index is canonical | `~/.gitmarks.toml` is the durable package truth |
+| Index is canonical | `~/.gitmark/index.toml` is the durable package truth |
 | Config is canonical | `config.toml` controls runtime paths and policies |
 | Runtime state is rebuildable | `state.json`, logs, repos, and temp dirs are derived and may be reconstructed |
 | One writer at a time | Mutating commands run under the filesystem lock |
-| Search is local | Search uses only local metadata, not remote or embedding services |
+| Search is local | Search uses only canonical index data and cached runtime artifacts, not remote or embedding services |
 | Kept repos may be shared | Multiple kept records with the same remote set reuse one repo directory |
 | Visible path may be nested | Returned paths are convenience entry points inside a full clone |
 | Tool-managed updates are destructive | Update resets managed clones to remote branch state |

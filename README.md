@@ -256,7 +256,7 @@ What they are for:
 - `freeze` and `unfreeze` control commit pinning.
 - `remove` / `rm` delete a bookmark and reconcile local derived state.
 - `doctor`, `cleanup`, and `sync` keep runtime state healthy.
-- `edit` opens `~/.gitmarks.toml` in your editor.
+- `edit` opens `~/./gitmark/index.toml` in your editor.
 
 ## Add and load examples
 
