@@ -1,5 +1,7 @@
 # git-mark
 
+> ⚠️ Deprecated in favor of [AGR](https://github.com/lirrensi/agr), this concept was too complex, too limited and made for old generation of agents. Now all they need is a .md file!
+
 `git-mark` is a CLI-first bookmark manager for git-backed resources, built for coding-agent workflows. ✨
 
 It exists to give an agent a portable, searchable list of resources that may be useful right now, without forcing all of them into active context at once. Prompts, skills, docs, templates, scripts, reference repos, asset collections, and repo subpaths can all live in one local index. The agent sees what is pinned by default, can search the broader catalog when needed, and can materialize any matching resource into a filesystem path on demand.
